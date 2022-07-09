@@ -1,14 +1,5 @@
 # Yellow-eyed Penguin SDM_Hickcoxetal2022
 
-**PI:**	Prof. Philip J. Seddon 
-
-**Code author:** Rachel P. Hickcox
-
-**Co-authors:** Dr. Thomas Mattern, Dr. Mariano Rodríguez Recio, Melanie J. Young, Prof. Yolanda Van Heezik
-
-##
----------------------------------------------------------------
-**Description**:
 This code accompanies the following paper: 
 
 Hickcox, R.P., van Heezik, Y., Mattern, T., Rodríguez Recio, M., Young, M. J., Seddon, P. J. (In review). Staying close to home: marine habitat selection by foraging yellow-eyed penguins using spatial distribution models.
