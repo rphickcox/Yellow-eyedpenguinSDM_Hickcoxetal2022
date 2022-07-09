@@ -1,0 +1,2280 @@
+---
+title: "DATA PARTITIONING & MAXENT: Hickcox et al. 2022"
+output: html_notebook
+author: Rachel Hickcox
+email: rphickcox@gmail.com
+date: 2018-2022
+editor_options:
+  chunk_output_type: console
+---
+
+### Load packages 
+```{r} 
+pkgs <- c("ggplot2", "tidyr", "raster", "dismo", "dplyr", "maptools", "sp", "hms",
+          "rgeos", "rgdal", "ENMeval", "gdalUtils", "sdm", "suncalc",
+          "lubridate", "data.table", "knitr", "kableExtra", "spatstat", 
+          "gridExtra", "broom", "ggpubr", "usdm", "virtualspecies", 
+          "corrplot", "MaxentVariableSelection", "blockCV", "sf", "rmaxent", 
+          "ggspatial", "ggrepel", "pals", "RColorBrewer", "scales", "shades", 
+          "gtable", "matrixStats", "stringr", "ade4") 
+invisible(lapply(pkgs, library, character.only = TRUE))
+rm(pkgs)
+options(scipen = 999)
+```
+
+### Loading map files
+```{r}
+parent <- getwd()
+nztm <- CRS("+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+nzmg2000 <- CRS("+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs")
+wgs <- CRS("+proj=longlat +datum=WGS84")
+local.tz <- "Pacific/Auckland"
+ext <- extent(1092142, 1790142, 4674234, 5447234)
+
+nz <- readOGR("NZ_polygon_NZTM2000_fixed.shp")
+nz <- spTransform(nz, nztm)
+
+bathymetry <- raster("bathymetry_formapping.tif")
+
+fishnet <- raster(ext, resolution = 500, crs = nztm)
+fishnet[] <- 1:ncell(fishnet)
+
+centroid <- readRDS("Maxent/centroid_raster")
+
+# For sunrise, sunset
+# 2020 is a leap year, so using as a convert for dates
+dunedin <- c(1405268.178,	4917870.867)
+sun <- data.frame(season = c("breeding", "premoult", "winter", "solstice"), 
+                  date = c("2020-12-01", "2020-03-01", "2020-05-01", "2020-12-21"), 
+                  lat = c(-45.8668, -45.8668, -45.8668, -45.8668),
+                  lon = c(170.4911, 170.4911, 170.4911, 170.4911))
+sun$date <- ymd(sun$date)
+sun_times <- getSunlightTimes(data = sun, 
+                              keep = c("sunrise", "sunriseEnd", 
+                                       "sunset", "sunsetStart"),
+                              tz = local.tz)
+sun_times <- cbind(season = sun$season, sun_times)
+sun_times <- sun_times %>%
+  mutate(sunrise_time = as_hms(sunrise)) %>%
+  mutate(sunset_time = as_hms(sunset))
+
+# Data not provided as sensitive information
+# Sites contains location information for the breeding sites
+# Sites_tracked contains information about the breeding sites where birds have been tracked
+sites <- read.csv("YEP site coordinates.csv")
+sort(unique(sites$site_name))
+sites_tracked <- read.csv("tracked_gps_sites.csv")
+sites_tracked$region[sites_tracked$region == "Stewart Island/Rakiura"] <- "Stewart Island"
+sites_tracked$region <- factor(sites_tracked$region, levels = c("Banks Peninsula", "North Otago", "Otago Peninsula", "Catlins", "Stewart Island"))
+sites_sp <- sites_tracked
+coordinates(sites_sp) <- ~x+y
+```
+
+# Setup functions
+```{r}
+# Capitalize first letter 
+firstup <- function(x) {
+  substr(x, 1, 1) <- toupper(substr(x, 1, 1))
+  x 
+}
+
+# Random sample; if the number of points is less than the sampling n, all points are used
+rsample <- function(x, n) {
+  if (length(x) <= n) return(x)
+  x[x %in% sample(x, n)]
+}
+
+# Count points per grid cell
+pointcount <- function(r, pts){
+  # make a raster of zeroes like the input
+  r2 = r
+  r2[] = 0
+  # get the cell index for each point and make a table:
+  counts = table(cellFromXY(r,pts))
+  # fill in the raster with the counts from the cell index:
+  r2[as.numeric(names(counts))] = counts
+  return(r2)
+}
+```
+
+<!-- ###################### RELOAD FILES USING THIS CODE ################### -->
+***
+### RELOADING all dataframes (created in section 1 + 2 below)
+```{r}
+# These change depending on the folder
+fs_otago <- c("Otapahi", "Victory Beach", "Aramoana", "Papanui", "Boulder Beach A1",  "Boulder Beach Midsection", "Double Bay")
+fs_nthotago <- c("Bobby's Head", "Bushy Beach")
+fs_catlins <- c("Long Point", "Seal Bay LP", "Seal Bay", 
+                "Nugget Point- Roaring Bay", "Hina Hina Cove", "Penguin Bay", 
+                "Nugget Point", "Helena Falls", 
+                "Te Rere", "Mahaka Point")
+fs_banks <- c("Shell Bay", "Goughs Bay", "Otanerito")
+fs_si <- c("Tommy Island", "Groper Island", "Goat Island", "Mephistopheles", "Rollers Beach", "Golden Beach", "Sealers Bay", "Pigeonhouse Bay", "Stewart Island")
+fs_all <- c("Otapahi", "Victory Beach", "Aramoana", "Papanui", "Boulder Beach A1",  "Boulder Beach Midsection", "Double Bay", "Bobby's Head", "Bushy Beach", "Long Point", "Seal Bay LP", "Seal Bay", "Nugget Point- Roaring Bay", "Hina Hina Cove", "Penguin Bay", "Nugget Point", "Helena Falls", "Te Rere", "Mahaka Point", "Shell Bay", "Goughs Bay", "Otanerito", "Tommy Island", "Goat Island", "Groper Island", "Mephistopheles", "Rollers Beach", "Golden Beach", "Sealers Bay", "Pigeonhouse Bay", "Stewart Island")
+
+###################
+all_data <- readRDS("Maxent/All_GPSTDRdata")
+all_data_pre <- readRDS("Maxent/All_pre2017_GPSTDRdata")
+all_data_ndd <- readRDS("Maxent/All_GPSdata")
+all_data_sat <- readRDS("Maxent/All_SATdata")
+all_data2 <- readRDS("Maxent/All_GPSTDRdata_GPSdata")
+all_data_final <- readRDS("Maxent/All_GPSTDRSATdata_final")
+
+# Reading in background points
+bg_extract <- read.csv("Maxent/Background_10000pt_SIextent.csv")
+bg <- bg_extract[2:3]
+bg_extract_banks <- read.csv("Maxent/Background_5000pt_banks.csv")
+bg_banks <- bg_extract_banks[2:3]
+bg_extract_nthotago <- read.csv("Maxent/Background_5000pt_nthotago.csv")
+bg_nthotago <- bg_extract_nthotago[2:3]
+bg_extract_otago <- read.csv("Maxent/Background_5000pt_otago.csv")
+bg_otago <- bg_extract_otago[2:3]
+bg_extract_catlins <- read.csv("Maxent/Background_5000pt_catlins.csv")
+bg_catlins <- bg_extract_catlins[2:3]
+bg_extract_stewart <- read.csv("Maxent/Background_5000pt_stewart.csv")
+bg_stewart <- bg_extract_stewart[2:3]
+
+p_allextract<- read.csv("Maxent/prbg_SIextent_envextract.csv")
+
+# Checkerboard2 sampling for cross-validation 
+check2 <- readRDS("Maxent/Filtered/Partitioncheckerboard2_presback_1hr.csv")
+
+# Creating dataframe of file names
+files_all <- Sys.glob(file.path(parent,"Maxent", "*final.csv")) # All
+files_f <-  Sys.glob(file.path(parent, "Maxent", "Filtered", "*.csv")) # Filtered
+files_ext <- Sys.glob(file.path(parent, "Maxent", "Filtered", "*extractenvar.csv"))
+files_final <- Sys.glob(file.path(parent,"Maxent", "Filtered", "*final.csv")) # All
+files_1h <- Sys.glob(file.path(parent,"Maxent", "Filtered", "*1hr.csv")) # All
+files_1h <- dplyr::filter(data.frame(x = files_1h), !grepl("All", x))
+files_maxent <- Sys.glob(file.path(parent, "Maxent", "Filtered", "*maxent.csv"))
+files_f <- data.frame(x = files_f) %>%
+  anti_join(data.frame(x = files_maxent), by = "x") %>%
+  dplyr::filter(!grepl("extractenvvar", x))
+
+# Reading all final data (GPS_TDR, satellite, GPS), including temporal, sex, regional subsets
+for (i in 1:length(files_all)) {
+  cc <- read.csv(files_all[i])
+  toread <- files_all[i]
+  nam_path <- unlist(strsplit(toread, "/"))
+  nam_file <- unlist(strsplit(nam_path[9], "_"))
+  nam <- tolower(nam_file[1])
+  
+  # Categorizing points based on region
+  # Banks = 1, North Otago = 2, Otago = 3, Catlins = 4, Stewart Island = 5
+  cc$region <- cc$site
+  cc$region[cc$region %in% fs_banks] <- 1
+  cc$region[cc$region %in% fs_nthotago] <- 2
+  cc$region[cc$region %in% fs_otago] <- 3
+  cc$region[cc$region %in% fs_catlins] <- 4
+  cc$region[cc$region %in% fs_si] <- 5
+  cc$X <- NULL
+  assign(paste("pt", nam, sep = "_"), cc)
+  coordinates(cc) <- ~x+y
+  assign(paste("sp", nam, sep = "_"), cc)
+}
+
+# Reading filtered data - including GPS_TDR, GPS, and SAT points
+# pt1 = 1hr, pt1thin = 1hr thinned 500m, pt100 = 100 points, pt100 = 100 points thinned 500m
+# RUN THIS TO READ IN pt1_all
+for (i in 1:length(files_final)) {
+  cc <- read.csv(files_final[i])
+  toread <- files_final[i]
+  nam_path <- unlist(strsplit(toread, "/"))
+  nam_file <- unlist(strsplit(nam_path[10], "_"))
+  nam <- tolower(nam_file[1])
+  nam2 <- tolower(nam_file[2])
+  nam3 <- tolower(nam_file[3])
+  
+  # Skip files that contain all data
+  if(nam3 == "extractenvvar"){
+    next
+  }
+  
+  # Categorizing points based on region
+  # Banks = 1, North Otago = 2, Otago = 3, Catlins = 4, Stewart Island = 5
+  cc$region <- cc$site
+  cc$region[cc$region %in% fs_banks] <- 1
+  cc$region[cc$region %in% fs_nthotago] <- 2
+  cc$region[cc$region %in% fs_otago] <- 3
+  cc$region[cc$region %in% fs_catlins] <- 4
+  cc$region[cc$region %in% fs_si] <- 5
+  cc$X <- NULL
+  
+  if(nam2 == "1hr"){
+    assign(paste("pt1", nam, sep = "_"), cc)
+    coordinates(cc) <- ~x+y
+    assign(paste("sp1", nam, sep = "_"), cc)
+  } else if(nam2 == "1hrthinned"){
+    assign(paste("pt1thin", nam, sep = "_"), cc)
+    coordinates(cc) <- ~x+y
+    assign(paste("sp1thin", nam, sep = "_"), cc)
+  } else if(nam2 == "50sample"){
+    assign(paste("pt50", nam, sep = "_"), cc)
+    coordinates(cc) <- ~x+y
+    assign(paste("sp50", nam, sep = "_"), cc)
+  } else if(nam2 == "50thinned"){
+    assign(paste("pt50thin", nam, sep = "_"), cc)
+    coordinates(cc) <- ~x+y
+    assign(paste("sp50thin", nam, sep = "_"), cc)
+  }
+}
+
+# Reading filtered data - including GPS_TDR, GPS, and SAT points
+# ONLY 1hr
+for (i in 1:nrow(files_1h)) {
+  cc <- read.csv(files_1h[i,])
+  toread <- files_1h[i,]
+  nam_path <- unlist(strsplit(toread, "/"))
+  nam_file <- unlist(strsplit(nam_path[10], "_"))
+  nam <- tolower(nam_file[1])
+  nam2 <- tolower(nam_file[2])
+  nam3 <- tolower(nam_file[3])
+  
+  # Skip files with presence/background points
+  if(nam2 == "presback"){
+    next
+  } else if (nam == "All"){
+    next
+  } else {
+    
+    # Categorizing points based on region
+    # Banks = 1, North Otago = 2, Otago = 3, Catlins = 4, Stewart Island = 5
+    cc$region <- cc$site
+    cc$region[cc$region %in% fs_banks] <- 1
+    cc$region[cc$region %in% fs_nthotago] <- 2
+    cc$region[cc$region %in% fs_otago] <- 3
+    cc$region[cc$region %in% fs_catlins] <- 4
+    cc$region[cc$region %in% fs_si] <- 5
+    cc$X <- NULL
+    
+    assign(paste("pt1", nam, sep = "_"), cc)
+    coordinates(cc) <- ~x+y
+    assign(paste("sp1", nam, sep = "_"), cc)
+  }
+}
+
+# Reading maxent filtered data (1 point/hour)
+# for (i in 1:length(files_maxent)) {
+#   cc <- read.csv(files_maxent[i])
+#   toread <- files_maxent[i]
+#   nam_path <- unlist(strsplit(toread, "/"))
+#   nam_file <- unlist(strsplit(nam_path[10], "_"))
+#   nam <- tolower(nam_file[1])
+#   nam2 <- tolower(nam_file[2])
+#   assign(paste("pt1", nam, "m", sep = "_"), cc)
+# }
+
+# Reading regional extracted environmental data (1 point/hour) for both presences and absences
+for (i in 1:length(files_ext)) {
+  cc <- read.csv(files_ext[i])
+  toread <- files_ext[i]
+  nam_path <- unlist(strsplit(toread, "/"))
+  nam_file <- unlist(strsplit(nam_path[10], "_"))
+  nam <- tolower(nam_file[1])
+  nam2 <- tolower(nam_file[2])
+  assign(paste(nam, "all", sep = "_"), cc)
+}
+
+# Environmental variables extracted to 1 point/hour- SI extent
+rasbind <- read.csv("Maxent/Filtered/Fishnetcentroid_extractenvvar_SIextent.csv") #centroids
+ext1_all <- read.csv("Maxent/Filtered/All_1hr_extractenvvar.csv") #all env var
+ext1_final <- read.csv("Maxent/Filtered/All_1hr_extractenvvar_final.csv") #final env var
+ext1_pred <- read.csv("Maxent/Filtered/All_1hr_extractenvvar_prediction.csv")
+
+# Environmental variable rasters
+parent2 <- "C:/Users/rphic/Desktop/Penguins PhD/Mapping/WORKING MAPPING/Environmental Layers/Marine/R Files 27_5_19/Resampled regional rasters"
+
+si_files <- Sys.glob(file.path(parent2, "*formapping.tif"))
+si_rasters <- lapply(si_files, raster)
+si_stacked <- stack(si_rasters)
+
+final_layers <- stack(si_stacked$bathymetry_formapping, 
+                      si_stacked$currents_formapping, 
+                      si_stacked$eucdistnest_formapping,
+                      si_stacked$gravel_formapping, 
+                      si_stacked$mud_formapping, 
+                      si_stacked$sand_formapping, 
+                      si_stacked$carbon_formapping, 
+                      si_stacked$botoxygen_formapping, 
+                      si_stacked$sstmean_formapping, 
+                      si_stacked$turbmean_formapping)
+
+final_layers_names <- c("bathymetry", 
+                        "currents", "distcolony", 
+                        "gravel", "mud", "sand", "carbon", "sf_do", 
+                        "sst_mean", 
+                        "turb_mean")
+names(final_layers) <- final_layers_names
+final_layers_nodist <- dropLayer(final_layers, 3)
+
+# with distance to all nest sites instead... for predictions
+final_layers_pred <- stack(si_stacked$bathymetry_formapping, 
+                           #si_stacked$chlamean_formapping, 
+                           si_stacked$currents_formapping, 
+                           si_stacked$eucdistnestall_formapping,
+                           #si_stacked$geomorphology_formapping, 
+                           si_stacked$gravel_formapping, 
+                           si_stacked$mud_formapping, 
+                           si_stacked$sand_formapping, 
+                           si_stacked$carbon_formapping, 
+                           si_stacked$botoxygen_formapping, 
+                           si_stacked$sstmean_formapping, 
+                           #si_stacked$trawlintensity_formapping, 
+                           #si_stacked$setnetintensity_formapping,
+                           si_stacked$turbmean_formapping)
+names(final_layers_pred) <- final_layers_names
+
+# Environmental variables final brick- regional extent
+envfolder <- "C:/Users/rphic/Desktop/Penguins PhD/Mapping/WORKING MAPPING"
+banks_crop <- readRDS("Maxent/Regional_rasters/banks_final")
+nthotago_crop <- readRDS("Maxent/Regional_rasters/nthotago_final")
+otago_crop <- readRDS("Maxent/Regional_rasters/otago_final")
+catlins_crop <- readRDS("Maxent/Regional_rasters/catlins_final")
+stewart_crop <- readRDS("Maxent/Regional_rasters/stewart_final")
+
+banks_pred <- readRDS("Maxent/Regional_rasters/banks_finalpred")
+nthotago_pred <- readRDS("Maxent/Regional_rasters/nthotago_finalpred")
+otago_pred <- readRDS("Maxent/Regional_rasters/otago_finalpred")
+catlins_pred <- readRDS("Maxent/Regional_rasters/catlins_finalpred")
+stewart_pred <- readRDS("Maxent/Regional_rasters/stewart_finalpred")
+
+si_ext <- shapefile(file.path("NZ basemaps/NZ_bufferedNZTM2000_75km_offshore.shp"))
+banks_poly <- shapefile(file.path("bankspeninsula_region_marine.shp"))
+nthotago_poly <- shapefile(file.path("nthotago_region_marine.shp"))
+otago_poly <- shapefile(file.path("otago_region_marine.shp"))
+catlins_poly <- shapefile(file.path("catlins_region_marine.shp"))
+stewart_poly <- shapefile(file.path("StewartI_region_marine.shp"))
+.startvar <- ls()
+```
+
+### RELOADING SI/Region models 
+```{r}
+############# THIS CHANGES EACH TIME! COMMENT/UNCOMMENT AS APPROPRIATE #########
+# To remove all variables created after the first reload chunks
+.startvar2 <- ls()
+.startvar_rm <- setdiff(.startvar2, .startvar)
+rm(list = .startvar_rm)
+
+region <- "banks"
+region <- "otago"
+region <- "nthotago"
+region <- "catlins"
+region <- "stewart"
+season <- "all" 
+
+pathn <- paste("Maxent/Dismo/", firstup(region), "model/", sep = "") 
+pathn
+
+################################################################################
+# ENMeval results
+enm_1hr <- readRDS("Maxent/ENMeval/bestevalmodel_1hr")
+enm_1hr_results <- read.csv("Maxent/ENMeval/enmeval_allmod_1hr_results.csv")
+
+# SI final model- ENMeval
+final_mod <- readRDS("Maxent/ENMeval/maxent_bestmod_1hr")
+aic.opt <- final_mod
+final_results <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_results.csv")
+final_predictdf <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions.csv")
+final_lambda <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_lambdas.csv")
+final_predictraster <- readRDS("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog")
+maxent_varimport_enmeval <- var.importance(final_mod) # df of % contribution, perm import.
+
+# SI final model - Dismo 
+best_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_SI.rds")
+best_results <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_results_SI.csv")
+pr_thr <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_thresholdMSS.csv")
+best_predictdf <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_SI.csv")
+#lambda <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_lambdas_SI.csv")
+best_predict <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_SI.rds")
+
+# SI final model - predicted to all colonies
+best_predictdf_col <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_allcol_SI.csv")
+best_predict_col <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_allcol_SI.rds")
+maxent_varimport <- var.importance(best_mod) # df of % contribution, perm import.
+
+# SI final model - no distnest 
+best_nodist_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_SI.rds")
+best_nodist_results <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_results_SI.csv")
+pr_thr_nodist <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_thresholdMSS.csv")
+best_nodist_predictdf <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_dfpredictions_SI.csv")
+#lambda <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_lambdas_SI.csv")
+best_nodist_predict <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_rastercloglog_SI.rds")
+maxent_varimport_nodist <- var.importance(best_nodist_mod) # df of % contribution, perm import.
+
+# Regional ENMeval results
+enm_1hr <- readRDS(paste("Maxent/ENMeval/bestevalmodel_1hr", region, sep = "_"))
+enm_1hr_results <- read.csv(paste("Maxent/ENMeval/enmeval_allmod_1hr_results_", region, ".csv", sep = ""))
+
+# Regional Final Model- ENMeval
+final_mod <- readRDS(paste("Maxent/ENMeval/maxent_bestmod_1hr", region, sep = "_"))
+final_results <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_results_", region, ".csv", sep = ""))
+final_predictdf <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions_", region, ".csv", sep = ""))
+final_lambda <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""))
+final_predictraster <- readRDS(paste("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog", region, sep = "_"))
+maxent_varimport_enmeval <- var.importance(final_mod) # df of % contribution, perm import.
+
+# Regional Final Model - Dismo 
+best_mod <- readRDS(paste(pathn, "maxent_bestmod_1hr_", region, ".rds", sep = ""))
+best_results <- read.csv(paste(pathn, "maxent_bestmod_1hr_results_", region, ".csv", sep = ""))
+best_predictdf <- read.csv(paste(pathn, "maxent_bestmod_1hr_dfpredictions_", region, ".csv", sep = ""))
+lambda <- read.csv(paste(pathn, "maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""))
+best_predict <- readRDS(paste(pathn, "maxent_bestmod_1hr_rastercloglog_", region, sep = ""))
+best_varimport <- var.importance(best_mod) # df of % contribution, perm import.
+
+# Regional Final Model - predicted to all colonies
+best_predictdf_col <- read.csv(paste(pathn, "maxent_bestmod_1hr_dfpredictions_allcol_", region, ".csv", sep = ""))
+best_predict_col <- readRDS( paste(pathn, "maxent_bestmod_1hr_rastercloglog_allcol_", region, sep = ""))
+
+# Regional Final Model - no dist
+best_nodist_mod <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_", region, ".rds", sep = ""))
+best_nodist_results <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_results_", region, ".csv", sep = ""))
+best_nodist_predictdf <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_dfpredictions_", region, ".csv", sep = ""))
+#lambda <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_lambdas_", region, ".csv", sep = ""))
+best_nodist_predict <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_rastercloglog_", region, sep = ""))
+
+# PCA results, South Island, distcolony included
+tt <- read.csv("Maxent/PCApoints_byregion.csv")
+pca2 <- readRDS("Maxent/PCA_results")
+```
+
+### SECTION 1: Point data import
+### WARNING: DO THIS ONLY ONCE, LOAD SAVED FILES AFTERWARDS (BEGINNING OF SCRIPT)
+<!-- ###################### POINT DATA IMPORT ############################## -->
+***
+#### Files prepared in gps_divedatas_prep.Rmd used here
+1. For all breeding sites, list files for interpolated dive data (gapfilter.csv)
+2. For individuals with poor dive data, list files for interpolated point data used (interpgps.csv)
+```{r}
+parent <- "Distribution Points"
+
+################### DIVE DATA ##################################################
+# Individuals with good dive data -> "alldives" file used
+# Looking in all subfolders of "parent" (e.g., Winter 2017)
+files_list <- data.frame(file = Sys.glob(file.path(parent, "GPS_TDR", "*", "*", "*gapfilter.csv")))
+
+files_list <- files_list %>% 
+  mutate(filenam = gsub('^(?:[^/]*/){2}','', file)) %>%
+  separate(filenam, sep = "/", into = c("season", "site", "ID"), extra = "drop", fill = "right") %>%
+  separate(ID, sep = "_", into = c("ID", "season", "year"), 
+           extra = "drop", fill = "right") %>%
+  mutate(ID = tolower(ID)) %>%
+  mutate(season = tolower(season)) %>%
+  mutate(season2 = str_replace(season, "incubation|postguard|guard", "breeding"))
+
+################### Pre-2017 DIVE DATA #########################################
+# Classified data in different format -> "alldives" file used
+# Looking in all subfolders of "parent" (e.g., Winter 2017)
+files_list_pre <- data.frame(file = Sys.glob(file.path(parent, "Pre2017_GPS_TDR", "*", "*alldives.csv")))
+
+files_list_pre <- files_list_pre %>% 
+  mutate(filenam = gsub('^(?:[^/]*/){2}','', file)) %>%
+  separate(filenam, sep = "/", into = c("site", "ID"), extra = "drop", fill = "right") %>%
+  separate(ID, sep = "_", into = c("ID", "season", "year"), 
+           extra = "drop", fill = "right") %>%
+  mutate(ID = tolower(ID)) %>%
+  mutate(season = tolower(season)) %>%
+  mutate(season2 = str_replace(season, "incubation|postguard|guard", "breeding"))
+
+################### GPS DATA ###################################################
+# Individuals with bad/no dive data -> "marinesub" file used
+# Looking in all subfolders of "parent" (e.g., Winter 2017)
+ndd <- data.frame(file = Sys.glob(file.path(parent, "GPS_only", "*", "*marinesub.csv")))
+ndd <- ndd %>% 
+  mutate(filenam = gsub('^(?:[^/]*/){2}','', file)) %>%
+  separate(filenam, sep = "/", into = c("site", "ID"), extra = "drop", fill = "right") %>%
+  separate(ID, sep = "_", into = c("ID", "season", "year"), 
+           extra = "drop", fill = "right") %>%
+  mutate(season = tolower(season)) %>%
+  mutate(ID = tolower(ID)) %>%
+  mutate(season2 = str_replace(season, "incubation|postguard|guard", "breeding"))
+
+################### GPS SATELLITE DATA #########################################
+# Individuals with satellite data -> "marinesub" file used
+# Creating dataframes containing only individuals from a certain region
+sat <- data.frame(file = Sys.glob(file.path(parent, "SatelliteWC", "*", "*marinesub.csv")))
+sat <- sat %>% 
+  mutate(filenam = gsub('^(?:[^/]*/){2}','', file)) %>%
+  separate(filenam, sep = "/", into = c("site", "ID"), extra = "drop", fill = "right") %>%
+  separate(ID, sep = "_", into = c("ID", "season", "year"), 
+           extra = "drop", fill = "right") %>%
+  mutate(season = tolower(season)) %>%
+  mutate(ID = tolower(ID)) %>%
+  mutate(season2 = str_replace(season, "incubation|postguard|guard", "breeding"))
+```
+
+#### Data Import
+1. Reads in files - GPS only, GPS_TDR, satellite
+2. Converts timestamps to POSIXct
+3. Adds a few extra columns for filtering later
+4. Saves all_data to R file
+```{r}
+################### GPS_TDR DATA ###############################################
+all_data <- data.frame()
+# Reading in GPS file for a specific site over all years using DIVE DATA
+for (i in 1:nrow(files_list)) {
+  cc <- read.csv(files_list$file[i])
+  cc <- cc[1:36]
+  
+  # Original file name used to assign microchip number/sex,year, season assigned to variables
+  toread <- files_list[i,]
+  nam <- toread$ID
+  season <- toread$season2
+  site <- toread$site
+  year <- toread$year
+  last <- tolower(paste(nam, season, year, sep = "_"))
+  
+  # Converting date columns to POSIXct NZDT timestamp
+  cc$begdesc <- parse_date_time(cc$begdesc,
+                                orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                                tz = local.tz)
+  cc$begasc <- parse_date_time(cc$begasc,
+                               orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                               tz = local.tz)
+  cc <- cc %>%
+    mutate(ID = nam) %>%
+    mutate(time = as_hms(begdesc)) %>%
+    mutate(site = site) %>%
+    mutate(season = season) %>%
+    mutate(full_id = last) %>%
+    mutate(datatype = "gps_tdr") %>%
+    arrange(begdesc)
+  
+  all_data <- rbind(all_data, cc)
+}
+all_data$ID <- toupper(all_data$ID)
+
+saveRDS(all_data, "Maxent/All_GPSTDRdata")
+write.csv(all_data, "Maxent/All_GPSTDRdata.csv")
+#all_data <- readRDS("Maxent/All_GPSTDRdata")
+
+################### Pre-2017 DIVE DATA ##########################################
+all_data_pre <- data.frame()
+header <- names(all_data)
+# Reading in GPS file for a specific site over all years using DIVE DATA
+for (i in 1:nrow(files_list_pre)) {
+  cc <- read.csv(files_list_pre$file[i])
+  
+  # Original file name used to assign microchip number/sex,year, season assigned to variables
+  toread <- files_list_pre[i,]
+  nam <- toread$ID
+  season <- toread$season2
+  site <- toread$site
+  year <- toread$year
+  last <- tolower(paste(nam, season, year, sep = "_"))
+  
+  # Converting date columns to POSIXct NZDT timestamp
+  # timestamp_UTC is actually NZDT; error originally
+  cc$timestamp_NZDT <- parse_date_time(cc$timestamp_UTC,
+                                       orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                                       tz = local.tz)
+  cc <- cc %>%
+    mutate(time = as_hms(timestamp_NZDT)) %>%
+    arrange(timestamp_NZDT)
+  
+  # Empty dataframe with the same columns as all_data (for dive data)
+  ccc <- data.frame(matrix(ncol = length(header), nrow = nrow(cc)))
+  names(ccc) <- header
+  ccc$ID <- cc$ID
+  ccc$x <- cc$x
+  ccc$y <- cc$y
+  ccc$trip.no <- cc$trip.no
+  ccc$divetim <- cc$divetim
+  ccc$begdesc <- cc$timestamp_NZDT
+  ccc$divetim <- cc$divetim
+  ccc$maxdep <- cc$maxdep
+  ccc$type <- cc$type
+  ccc$typenum <- cc$typenum
+  ccc$time <- cc$time
+  ccc$site <- site
+  ccc$season <- season
+  ccc$full_id <- last
+  ccc$datatype <- "gps_tdr"
+  
+  # Extracting  bathymetry data for each point
+  shpoint_dive <- ccc
+  coordinates(shpoint_dive) <- ~x + y
+  crs(shpoint_dive) <- nztm
+  bathy_extract <- raster::extract(bathymetry, 
+                                   shpoint_dive, 
+                                   fun = max, 
+                                   na.rm = TRUE)
+  
+  # Distance to breeding area, distance to land
+  dist_land <- gDistance(nz, 
+                         shpoint_dive, 
+                         byid = TRUE)
+  bsite_coord <- sites[sites$site2 == site,]
+  coordinates(bsite_coord) <- ~x + y
+  crs(bsite_coord) <- nztm
+  dist_nest <- gDistance(bsite_coord, 
+                         shpoint_dive, 
+                         byid = TRUE)
+  ccc$bathy_extract <- as.numeric(bathy_extract)
+  ccc$dist_land <- as.numeric(dist_land)
+  ccc$dist_nest <- as.numeric(dist_nest)
+  
+  dis_travel <- data.frame(dis = spDists(shpoint_dive, segments = TRUE))
+  dis_travel[nrow(ccc),] <- NA
+  ccc$distance.m <- dis_travel$dis
+  all_data_pre <- rbind(all_data_pre, ccc)
+}
+
+saveRDS(all_data_pre, "Maxent/All_pre2017_GPSTDRdata")
+write.csv(all_data_pre, "Maxent/All_pre2017_GPSTDRdata.csv")
+#all_data_pre <- readRDS("Maxent/All_pre2017_GPSTDRdata")
+
+################### GPS DATA ###############################################
+all_data_ndd <- data.frame()
+header <- names(all_data)
+# Reading in GPS file for a specific site over all years using DIVE DATA
+for (i in 1:nrow(ndd)) {
+  cc <- read.csv(ndd$file[i])
+  
+  # Original file name used to assign microchip number/sex,year, season assigned to variables
+  toread <- ndd[i,]
+  nam <- toread$ID
+  season <- toread$season2
+  site <- toread$site
+  year <- toread$year
+  last <- tolower(paste(nam, season, year, sep = "_"))
+  
+  # Converting date columns to POSIXct NZDT timestamp
+  cc$timestamp_NZDT <- parse_date_time(cc$timestamp_NZDT,
+                                       orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                                       tz = local.tz)
+  cc <- cc %>%
+    mutate(time = as_hms(timestamp_NZDT)) %>%
+    arrange(timestamp_NZDT)
+  
+  # Empty dataframe with the same columns as all_data (for dive data)
+  ccc <- data.frame(matrix(ncol = length(header), nrow = nrow(cc)))
+  names(ccc) <- header
+  ccc$ID <- cc$ID
+  ccc$x <- cc$lon
+  ccc$y <- cc$lat
+  ccc$trip.no <- cc$trips
+  ccc$begdesc <- cc$timestamp_NZDT
+  ccc$time <- cc$time
+  ccc$site <- site
+  ccc$season <- season
+  ccc$full_id <- last
+  ccc$datatype <- "gps"
+  
+  # Extracting  bathymetry data for each point
+  shpoint_dive <- ccc
+  coordinates(shpoint_dive) <- ~x + y
+  crs(shpoint_dive) <- nztm
+  bathy_extract <- raster::extract(bathymetry, 
+                                   shpoint_dive, 
+                                   fun = max, 
+                                   na.rm = TRUE)
+  
+  # Distance to breeding area, distance to land
+  dist_land <- gDistance(nz, 
+                         shpoint_dive, 
+                         byid = TRUE)
+  bsite_coord <- sites[sites$site2 == site,]
+  coordinates(bsite_coord) <- ~x + y
+  crs(bsite_coord) <- nztm
+  dist_nest <- gDistance(bsite_coord, 
+                         shpoint_dive, 
+                         byid = TRUE)
+  ccc$bathy_extract <- as.numeric(bathy_extract)
+  ccc$dist_land <- as.numeric(dist_land)
+  ccc$dist_nest <- as.numeric(dist_nest)
+  
+  dis_travel <- data.frame(dis = spDists(shpoint_dive, segments = TRUE))
+  dis_travel[nrow(ccc),] <- NA
+  ccc$distance.m <- dis_travel$dis
+  all_data_ndd <- rbind(all_data_ndd, ccc)
+}
+
+saveRDS(all_data_ndd, "Maxent/All_GPSdata")
+write.csv(all_data_ndd, "Maxent/All_GPSdata.csv")
+#all_data_ndd <- readRDS("Maxent/All_GPSdata")
+
+# Three birds without TDR data were included in the dataset of GPS_TDR due to small sample size
+# Te Rere x 2 (0 individuals have TDR data)
+# Shell Bay x 1 (1 individual has TDR data)
+temp <- all_data_ndd %>%
+  filter(ID == "m982000407011612" | ID == "f982000405533506" | ID == "M982000405531602" | ID == "f18472")
+
+# Creating dataframe with all GPS_TDR data (2003-2020), including three individuals with GPS only
+all_data2 <- rbind(all_data, all_data_pre, temp)
+saveRDS(all_data2, "Maxent/All_GPSTDRdata_GPSdata")
+write.csv(all_data2, "Maxent/All_GPSTDRdata_GPSdata.csv")
+#all_data2 <- readRDS("Maxent/All_GPSTDRdata_GPSdata")
+
+################### GPS SATELLITE DATA #########################################
+all_data_sat <- data.frame()
+header <- names(all_data)
+# Reading in GPS file for a specific site over all years using DIVE DATA
+for (i in 1:nrow(sat)) {
+  cc <- read.csv(sat$file[i])
+  
+  # Original file name used to assign microchip number/sex,year, season assigned to variables
+  toread <- sat[i,]
+  nam <- toread$ID
+  season <- toread$season2
+  site <- toread$site
+  year <- toread$year
+  last <- tolower(paste(nam, season, year, sep = "_"))
+  
+  # Converting date columns to POSIXct NZDT timestamp
+  cc$timestamp_NZDT <- parse_date_time(cc$timestamp_NZDT,
+                                       orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                                       tz = local.tz)
+  cc <- cc %>%
+    mutate(time = as_hms(timestamp_NZDT)) %>%
+    arrange(timestamp_NZDT)
+  
+  # Empty dataframe with the same columns as all_data (for dive data)
+  ccc <- data.frame(matrix(ncol = length(header), nrow = nrow(cc)))
+  names(ccc) <- header
+  ccc$ID <- cc$ID
+  ccc$x <- cc$lon
+  ccc$y <- cc$lat
+  ccc$trip.no <- cc$trips
+  ccc$begdesc <- cc$timestamp_NZDT
+  ccc$time <- cc$time
+  ccc$site <- site
+  ccc$season <- season
+  ccc$full_id <- last
+  ccc$datatype <- "sat"
+  
+  # Extracting  bathymetry data for each point
+  shpoint_dive <- ccc
+  coordinates(shpoint_dive) <- ~x + y
+  crs(shpoint_dive) <- nztm
+  bathy_extract <- raster::extract(bathymetry, 
+                                   shpoint_dive, 
+                                   fun = max, 
+                                   na.rm = TRUE)
+  
+  # Distance to breeding area, distance to land
+  dist_land <- gDistance(nz, 
+                         shpoint_dive, 
+                         byid = TRUE)
+  bsite_coord <- sites[sites$site2 == site,]
+  coordinates(bsite_coord) <- ~x + y
+  crs(bsite_coord) <- nztm
+  dist_nest <- gDistance(bsite_coord, 
+                         shpoint_dive, 
+                         byid = TRUE)
+  ccc$bathy_extract <- as.numeric(bathy_extract)
+  ccc$dist_land <- as.numeric(dist_land)
+  ccc$dist_nest <- as.numeric(dist_nest)
+  
+  dis_travel <- data.frame(dis = spDists(shpoint_dive, segments = TRUE))
+  dis_travel[nrow(ccc),] <- NA
+  ccc$distance.m <- dis_travel$dis
+  all_data_sat <- rbind(all_data_sat, ccc)
+}
+
+# Satellite data does not have a trip number (couldn't be determined); using date instead
+all_data_sat <- all_data_sat %>%
+  mutate(day = date(begdesc)) %>% 
+  group_by(full_id) %>% 
+  mutate(trip.no = as.numeric(factor(day))) 
+all_data_sat$day <- NULL
+
+saveRDS(all_data_sat, "Maxent/All_SATdata")
+write.csv(all_data_sat, "Maxent/All_SATdata.csv")
+#all_data_sat <- readRDS("Maxent/All_SATdata")
+
+# Creating one big final dataset with GPS_TDR, satellite, and GPS (select few) data
+all_data_final <- rbind(all_data2, all_data_sat)
+saveRDS(all_data_final, "Maxent/All_GPSTDRSATdata_final")
+write.csv(all_data_final, "Maxent/All_GPSTDRSATdata_final.csv")
+#all_data_final <- readRDS("Maxent/All_GPSTDRSATdata_final")
+
+###################
+# Plotting
+sp_reg <- all_data
+coordinates(sp_reg) <- ~x + y
+sp_all <- all_data2
+coordinates(sp_all) <- ~x + y
+sp_ndd <- all_data_ndd
+coordinates(sp_ndd) <- ~x + y
+sp_sat <- all_data_sat
+coordinates(sp_sat) <- ~x + y
+sp_final <- all_data_final
+coordinates(sp_final) <- ~x + y
+
+plot(sp_all)
+plot(sp_ndd, add=T, col = "red")
+
+# Just data with GPS + TDR data
+n_distinct(all_data$full_id)
+n_distinct(all_data$ID)
+
+# Not including satellite or gps only data
+n_distinct(all_data2$full_id)
+n_distinct(all_data2$ID)
+
+# Including satellite and gps only data
+n_distinct(all_data_final$full_id)
+n_distinct(all_data_final$ID)
+```
+
+#### Sampling and filtering all GPS_TDR points into 4 datasets
+##### Temporal- 1 point every hour (first point), no thinning; unequal number per individual
+```{r}
+r <- raster(sp_all) # Creating empty raster with extent of ssp
+res(r) <- 500 # Should be 500 x 500 m
+#ex <- drawExtent(show=T) # Selects extent on plot
+
+xx <- distinct(all_data2, x, y, .keep_all = TRUE) # Removes rows duplicated lat/lon values
+xxx <- xx
+coordinates(xxx) <- ~x + y
+
+df_onehr <- xx %>%
+  mutate(hr = hour(time), minutes = as.integer(minute(time))) %>% 
+  group_by(full_id, trip.no, hr) %>% 
+  filter(minutes == min(minutes))
+table(df_onehr$full_id)
+nrow(df_onehr)
+
+sp_onehr <- df_onehr
+coordinates(sp_onehr) <- ~x+y
+plot(sp_onehr)
+write.csv(df_onehr, "Maxent/Filtered/All_1hr.csv")
+
+# More than one point per cell; counting and plotting 
+ct_onehr <- pointcount(r, sp_onehr) # number of points in a cell
+ct_onehr[ct_onehr == 0] <- NA
+ggplot() + 
+  geom_raster(data = as.data.frame(ct_onehr, xy = TRUE), aes(x = x, y = y, fill = layer)) +
+  scale_fill_continuous(low = "steelblue2", high = "red", 
+                        guide = "colorbar", na.value = "white") +
+  geom_polygon(data = nz, aes(x = long, y = lat, z = NULL, group = group), size = 0.1, color = "gray", fill = "white")
+```
+
+#### Sampling and filtering all GPS_TDR and Satellite (final) data into 4 datasets
+##### Temporal- 1 point every hour (first point), no thinning; unequal number per individual
+```{r}
+r <- raster(sp_final) # Creating empty raster with extent of ssp
+res(r) <- 500 # Should be 500 x 500 m
+#ex <- drawExtent(show=T) # Selects extent on plot
+
+xx <- distinct(all_data_final, x, y, .keep_all = TRUE) #Removes rows duplicated lat/lon values
+xxx <- xx
+coordinates(xxx) <- ~x + y
+
+df_onehr_final <- xx %>%
+  mutate(hr = hour(time), minutes = as.integer(minute(time))) %>% 
+  group_by(full_id, trip.no, hr) %>% 
+  filter(minutes == min(minutes))
+
+sp_onehr_final <- df_onehr_final
+coordinates(sp_onehr_final) <- ~x+y
+plot(sp_onehr_final)
+
+write.csv(df_onehr_final, "Maxent/Filtered/All_1hr_final.csv", row.names = FALSE)
+```
+
+#### For dataset of 1 point/hour, filter to regional subsets
+```{r}
+# Filtering df_onehr_final
+pt1_all <- df_onehr_final
+pt1_otago <- df_onehr_final %>% filter(site %in% fs_otago)
+pt1_banks <- df_onehr_final %>% filter(site %in% fs_banks)
+pt1_catlins <- df_onehr_final %>% filter(site %in% fs_catlins)
+pt1_nthotago <- df_onehr_final %>% filter(site %in% fs_nthotago)
+pt1_stewart <- df_onehr_final %>% filter(site %in% fs_si)
+
+# Making spatialpointsdataframe
+sp1_all <- pt1_all
+coordinates(sp1_all) <- ~x+y
+sp1_banks <- pt1_banks
+coordinates(sp1_banks) <- ~x+y
+sp1_nthotago <- pt1_nthotago
+coordinates(sp1_nthotago) <- ~x+y
+sp1_otago <- pt1_otago
+coordinates(sp1_otago) <- ~x+y
+sp1_catlins <- pt1_catlins
+coordinates(sp1_catlins) <- ~x+y
+sp1_stewart <- pt1_stewart
+coordinates(sp1_stewart) <- ~x+y
+
+# Saving as csv
+write.csv(pt1_banks, "Maxent/Filtered/Banks_1hr.csv", row.names = FALSE)
+write.csv(pt1_nthotago, "Maxent/Filtered/Nthotago_1hr.csv", row.names = FALSE)
+write.csv(pt1_otago, "Maxent/Filtered/Otago_1hr.csv", row.names = FALSE)
+write.csv(pt1_catlins, "Maxent/Filtered/Catlins_1hr.csv", row.names = FALSE)
+write.csv(pt1_stewart, "Maxent/Filtered/Stewart_1hr.csv", row.names = FALSE)
+
+# Creating Maxent files of each (species, longitude, latitude, var1, var2...)
+pt1_all_m <- raster::extract(final_layers, pt1_all[c("x","y")], df = TRUE)
+pt1_all_m <- pt1_all_m %>%
+  mutate(species = "YEP", longitude = pt1_all$x, latitude = pt1_all$y, .before = ID) %>%
+  drop_na() # Will result in less rows than pt1_all!!
+
+pt1_otago_m <- raster::extract(final_layers, pt1_otago[c("x","y")], df = TRUE)
+pt1_otago_m <- pt1_otago_m %>%
+  mutate(species = "YEP", longitude = pt1_otago$x, latitude = pt1_otago$y, .before = ID)
+
+pt1_banks_m <- raster::extract(final_layers, pt1_banks[c("x","y")], df = TRUE)
+pt1_banks_m <- pt1_banks_m %>%
+  mutate(species = "YEP", longitude = pt1_banks$x, latitude = pt1_banks$y, .before = ID)
+
+pt1_catlins_m <- raster::extract(final_layers, pt1_catlins[c("x","y")], df = TRUE)
+pt1_catlins_m <- pt1_catlins_m %>%
+  mutate(species = "YEP", longitude = pt1_catlins$x, latitude = pt1_catlins$y, .before = ID)
+
+pt1_nthotago_m <- raster::extract(final_layers, pt1_nthotago[c("x","y")], df = TRUE)
+pt1_nthotago_m <- pt1_nthotago_m %>%
+  mutate(species = "YEP", longitude = pt1_nthotago$x, latitude = pt1_nthotago$y, .before = ID)
+
+pt1_stewart_m <- raster::extract(final_layers, pt1_stewart[c("x","y")], df = TRUE)
+pt1_stewart_m <- pt1_stewart_m %>%
+  mutate(species = "YEP", longitude = pt1_stewart$x, latitude = pt1_stewart$y, .before = ID)
+
+# Saving as csv
+write.csv(pt1_banks_m, "Maxent/Filtered/Banks_1hr_maxent.csv", 
+          row.names = FALSE)
+write.csv(pt1_nthotago_m, "Maxent/Filtered/Nthotago_1hr_maxent.csv", 
+          row.names = FALSE)
+write.csv(pt1_otago_m, "Maxent/Filtered/Otago_1hr_maxent.csv", 
+          row.names = FALSE)
+write.csv(pt1_catlins_m, "Maxent/Filtered/Catlins_1hr_maxent.csv", 
+          row.names = FALSE)
+write.csv(pt1_stewart_m, "Maxent/Filtered/Stewart_1hr_maxent.csv", 
+          row.names = FALSE)
+```
+
+#### Summarizing sample size of pt1_all (1 point/hour)
+#### This does not include satellite data (+1 indivdual)
+```{r}
+nn <- n_distinct(pt1_all$site)
+uniqueID <- pt1_all %>%
+  group_by(site, full_id) %>%
+  summarize(unique(ID))
+
+n_sites <- pt1_all %>%
+  group_by(site) %>%
+  summarize("total individuals" = n_distinct(ID), 
+            "total deployments" = n_distinct(full_id))
+
+n_season <- pt1_all %>%
+  group_by(site, season) %>%
+  summarize("number of individuals" = n_distinct(ID)) %>%
+  pivot_wider(names_from = "season", values_from = "number of individuals") %>%
+  right_join(n_sites)
+
+n_sex <- pt1_all %>%
+  mutate("sex" =  tolower(substr(ID, 1, 1))) %>%
+  group_by(site, sex) %>%
+  summarize("n" = n_distinct(ID)) %>%
+  pivot_wider(names_from = sex, values_from = n)
+
+ndf <- n_sex %>%
+  right_join(n_season)
+ndf2 <- n_sex %>%
+  right_join(n_season) %>%
+  pivot_longer(cols = -site, names_to = "season", values_to = "n")
+clipr::write_clip(ndf)
+
+nn <- n_distinct(all_data_final$site)
+uniqueID <- all_data_final %>%
+  group_by(site, full_id) %>%
+  summarize(unique(ID))
+
+n_sites <- all_data_final %>%
+  group_by(site) %>%
+  summarize("total individuals" = n_distinct(ID), "total deployments" = n_distinct(full_id))
+
+n_season <- all_data_final %>%
+  group_by(site, season) %>%
+  summarize("number of individuals" = n_distinct(ID)) %>%
+  pivot_wider(names_from = "season", values_from = "number of individuals") %>%
+  right_join(n_sites)
+
+n_sex <- all_data_final %>%
+  mutate("sex" =  tolower(substr(ID, 1, 1))) %>%
+  group_by(site, sex) %>%
+  summarize("n" = n_distinct(ID)) %>%
+  pivot_wider(names_from = sex, values_from = n)
+
+ndf <- n_sex %>%
+  right_join(n_season)
+ndf2 <- n_sex %>%
+  right_join(n_season) %>%
+  pivot_longer(cols = -site, names_to = "season", values_to = "n")
+clipr::write_clip(ndf)
+```
+
+### SECTION 2: ENVIRONMENTAL RASTER IMPORT
+### WARNING: DO THIS ONLY ONCE, LOAD SAVED FILES AFTERWARDS (BEGINNING OF SCRIPT)
+<!-- ###################### ENVIRONMENTAL RASTER IMPORT #################### -->
+***
+#### See mapping_marine.R script for details on raster creation
+#### Load environmental rasters
+#### Reload all rasters into a stack for each region
+```{r}
+parent2 <- getwd()
+
+si_files <- Sys.glob(file.path(parent2, "*formapping.tif"))
+si_rasters <- lapply(si_files, raster)
+si_stacked <- stack(si_rasters)
+names(si_stacked)
+
+touse <- stack(si_stacked$bathymetry_formapping, 
+               si_stacked$chlamax_formapping, 
+               si_stacked$chlamean_formapping, 
+               si_stacked$chlamin_formapping,
+               si_stacked$chlameanpm_formapping, 
+               si_stacked$chlameanbr_formapping, 
+               si_stacked$chlameanwi_formapping, 
+               si_stacked$currents_formapping, 
+               si_stacked$eucdist_formapping, 
+               si_stacked$eucdistnest_formapping, 
+               si_stacked$eucdist500m_formapping, 
+               si_stacked$gravel_formapping, 
+               si_stacked$mud_formapping, 
+               si_stacked$sand_formapping, 
+               si_stacked$carbon_formapping, 
+               si_stacked$botnitrogen_formapping, 
+               si_stacked$botoxygen_formapping, 
+               si_stacked$botsalinity_formapping, 
+               si_stacked$bottemp_formapping, 
+               si_stacked$sfargonite_formapping, 
+               si_stacked$sfsilicate_formapping,
+               si_stacked$sstmax_formapping, 
+               si_stacked$sstmean_formapping, 
+               si_stacked$sstmin_formapping, 
+               si_stacked$sstmeanbr_formapping, 
+               si_stacked$sstmeanpm_formapping, 
+               si_stacked$sstmeanwi_formapping, 
+               si_stacked$turbmax_formapping, 
+               si_stacked$turbmean_formapping, 
+               si_stacked$turbmin_formapping, 
+               si_stacked$turbmeanbr_formapping, 
+               si_stacked$turbmeanpm_formapping, 
+               si_stacked$turbmeanwi_formapping, 
+               si_stacked$sediment_formapping, 
+               si_stacked$eucdistnestall_formapping)
+
+stack_names <- c("x", "y", "bathymetry", "chla_max", "chla_mean", "chla_min", "chla_mean_pm",
+                 "chla_mean_br", "chla_mean_wi", "currents", "distland", "distcolony", "dist500m",
+                 "gravel", "mud", "sand", "carbon", "sf_nitrogen", "sf_oxygen", "sf_salinity", "sf_temp",
+                 "sf_argonite", "sf_silicate", "sst_max","sst_mean", "sst_min", "sst_mean_br",
+                 "sst_mean_pm", "sst_mean_wi", "turb_max", "turb_mean", "turb_min", "turb_mean_br",
+                 "turb_mean_pm", "turb_mean_wi", "sediment", "distcolonyall")
+```
+
+#### Extracting values of each raster to points
+```{r}
+# To centroid (all grid cells)
+rasext <- raster::extract(touse, centroid)
+rasbind <- data.frame(centroid@coords, rasext)
+names(rasbind) <- stack_names
+write.csv(rasbind, "Maxent/Filtered/Fishnetcentroid_extractenvvar_SIextent.csv", row.names = FALSE)
+#rasbind <- read.csv("Maxent/Filtered/Fishnetcentroid_extractenvvar_SIextent.csv")
+
+# To presence points sampled 1/ hour
+ext1_all <- raster::extract(touse, sp1_all)
+ext1_all <- data.frame(sp1_all@coords, ext1_all)
+names(ext1_all) <- stack_names
+write.csv(ext1_all, "Maxent/Filtered/All_1hr_extractenvvar.csv", row.names = FALSE)
+#ext1_all <- read.csv("Maxent/Filtered/All_1hr_extractenvvar.csv")
+```
+
+# All variables, not including max/min sst/turbidity/chla or sediment category layer
+```{r}
+# Not including min/max values
+rasbind2 <- rasbind[c(1:3, 5, 10:13, 15:24, 26, 32, 41)]
+touse2 <- stack(si_stacked$bathymetry_formapping, 
+                si_stacked$chlamean_formapping, 
+                si_stacked$currents_formapping, 
+                si_stacked$eucdist_formapping, 
+                si_stacked$eucdistnest_formapping, 
+                si_stacked$eucdist500m_formapping, 
+                si_stacked$gravel_formapping, 
+                si_stacked$mud_formapping, 
+                si_stacked$sand_formapping, 
+                si_stacked$carbon_formapping, 
+                si_stacked$botnitrogen_formapping, 
+                si_stacked$botoxygen_formapping, 
+                si_stacked$botsalinity_formapping, 
+                si_stacked$bottemp_formapping, 
+                si_stacked$sfargonite_formapping, 
+                si_stacked$sfsilicate_formapping,
+                si_stacked$sstmean_formapping, 
+                si_stacked$turbmean_formapping)
+```
+
+<!-- ###################### COLLINEARITY ENV PREDICTIONS ################### -->
+***
+#### Collinearity matrix figure 
+#### https://scholar.sun.ac.za/bitstream/handle/10019.1/103840/geldenhuys_species_2018.pdf?sequence=1
+```{r}
+# Collinearity between environmental predictors. Red squares indicate negative correlations and blue squares indicate positive correlations. Square size indicated the strength of the correlation. 
+
+# All variables
+cor1_all <- cor(rasbind[,3:ncol(rasbind)], use = "complete.obs", method = "spearman")
+
+# Corrplot with upper coefficients and lower squares
+# png("Maxent/Plots_outputs/corrplot_full.png", width = 800, height = 800)
+# corrplot.mixed(cor1_all, number.cex=0.8, tl.cex = 0.9, tl.col = "black", lower = "square", upper = "number", tl.pos = c("lt"), order = "FPC")
+# dev.off()
+
+# Corrplot with upper coefficients (Spearman); non-significant correlations are shown in white
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+cor1_sig <- cor.mtest(cor1_all, conf.level = 0.95)
+png("Maxent/Plots_outputs/corrplotsig_full.png", width = 800, height = 800)
+corrplot(cor1_all, method = "color", col = col(200), type = "upper", 
+         order = "hclust", number.cex = 0.8, addCoef.col = "black", 
+         tl.col = "black", tl.srt = 90, p.mat = cor1_sig$p, sig.level = 0.05, 
+         insig = "blank",  na.label = "square")
+dev.off()
+
+# All variables, not including max/min sst/turbidity/chla
+cor1_all2 <- cor(rasbind2[,3:ncol(rasbind2)], use = "complete.obs", method = "spearman")
+cor1_sig2 <- cor.mtest(cor1_all2, conf.level = 0.95)
+png("Maxent/Plots_outputs/corrplotsig_candidates.png", width = 800, height = 800)
+corrplot(cor1_all2, method = "color", col = col(200), type = "upper", 
+         order = "hclust", number.cex = 0.8, addCoef.col = "black", 
+         tl.col = "black", tl.srt = 90, p.mat = cor1_sig2$p, sig.level = 0.05, 
+         insig = "blank",  na.label = "square")
+dev.off()
+```
+
+#### Raster Collinearity Test/ correlations for raster stack: Absolute value of correlation coefficients (|r|)
+#### correlation analysis and select uncorrelated variables <0.7
+#### VIF (variance inflation factor) with a strict threshold of 3 or 4 - I used 10
+#### Outputs to clipboard and pasted/edited in summarytables_maxent.xlsx
+```{r}
+# virtualspecies
+allvar <- removeCollinearity(touse, plot = TRUE, multicollinearity.cutoff = 0.7, sample.points = TRUE, nb.points = 10000)
+allvar2 <- png("Maxent/Plots_outputs/corrdendrogram.png", width = 800, height = 400)
+removeCollinearity(touse2, plot = TRUE, multicollinearity.cutoff = 0.7, sample.points = TRUE, nb.points = 20000, method = "spearman")
+dev.off()
+
+vif(tu1)
+
+# usdm
+# vifall2 is used as the final results because it includes only mean sst/turb/chla
+vifall2 <- vif(touse2)
+#vifstack2 <- vifcor(touse2, th = 0.7) #both cor and VIF
+#vifstack3 <- vifstep(touse2, th = 10)
+
+clipr::write_clip(vifall2)
+#clipr::write_clip(vifstack2@results)
+```
+
+#### FINAL LAYERS: Based on vifcor results and expert knowledge, the following layers were included in the models
+```{r}
+final_layers <- stack(si_stacked$bathymetry_formapping, 
+                      si_stacked$currents_formapping, 
+                      si_stacked$eucdistnest_formapping, 
+                      si_stacked$gravel_formapping, 
+                      si_stacked$mud_formapping, 
+                      si_stacked$sand_formapping, 
+                      si_stacked$carbon_formapping, 
+                      si_stacked$botoxygen_formapping, 
+                      si_stacked$sstmean_formapping, 
+                      si_stacked$turbmean_formapping) 
+
+vif_final <- vif(final_layers)
+vifstack_final <- vifcor(final_layers, th = 0.7)
+clipr::write_clip(vif_final)
+clipr::write_clip(vifstack_final@results)
+
+final_layers_names <- c("bathymetry", "currents", "distcolony",
+                        "gravel", "mud", "sand", "carbon", "sf_do", 
+                        "sst_mean", "turb_mean")
+names(final_layers) <- final_layers_names
+
+# Using distance to ALL nests instead of distance to tracked nests. For predictions
+final_layers_pred <- stack(si_stacked$bathymetry_formapping, 
+                           si_stacked$currents_formapping, 
+                           si_stacked$eucdistnestall_formapping,
+                           si_stacked$gravel_formapping, 
+                           si_stacked$mud_formapping, 
+                           si_stacked$sand_formapping, 
+                           si_stacked$carbon_formapping, 
+                           si_stacked$botoxygen_formapping, 
+                           si_stacked$sstmean_formapping, 
+                           si_stacked$turbmean_formapping)
+names(final_layers_pred) <- final_layers_names
+
+# Extract final layers to presence points
+ext1_final <- raster::extract(final_layers, sp1_all)
+ext1_final <- data.frame(sp1_all@coords, sp1_all@data, ext1_final)
+write.csv(ext1_all, "Maxent/Filtered/All_1hr_extractenvvar_final.csv", row.names = FALSE)
+#ext1_final <- read.csv("Maxent/Filtered/All_1hr_extractenvvar_final.csv")
+
+ext1_pred <- raster::extract(final_layers_pred, sp1_all)
+ext1_pred <- data.frame(sp1_all@coords, sp1_all@data, ext1_pred)
+write.csv(ext1_pred, "Maxent/Filtered/All_1hr_extractenvvar_prediction.csv", row.names = FALSE)
+#ext1_pred <- read.csv("Maxent/Filtered/All_1hr_extractenvvar_prediction.csv")
+```
+
+### SECTION 3: REGIONAL ENVIRONMENTAL PREDICTORS AND BACKGROUND POINTS
+<!-- ###################### REGIONAL AND BG ########################## -->
+***
+#### For regional environmental data
+1. Read in shapefiles created in arcgis of the extent for each region
+2. Crop raster stack to each regional extent, save
+```{r}
+# This can change
+banks_poly <- shapefile(file.path("bankspeninsula_region_marine.shp"))
+nthotago_poly <- shapefile(file.path("nthotago_region_marine.shp"))
+otago_poly <- shapefile(file.path("otago_region_marine.shp"))
+catlins_poly <- shapefile(file.path("catlins_region_marine.shp"))
+stewart_poly <- shapefile(file.path("StewartI_region_marine.shp"))
+###############################
+
+# Cropping env predictor rasters of SI extent to regional extent
+banks_crop <- crop(final_layers, banks_poly)
+nthotago_crop <- crop(final_layers, nthotago_poly)
+otago_crop <- crop(final_layers, otago_poly)
+catlins_crop <- crop(final_layers, catlins_poly)
+stewart_crop <- crop(final_layers, stewart_poly)
+
+# Saving regional raster brick as RDS file
+saveRDS(banks_crop, "Maxent/Regional_rasters/banks_final")
+#banks_crop <- readRDS("Maxent/Regional_rasters/banks_final")
+saveRDS(nthotago_crop, "Maxent/Regional_rasters/nthotago_final")
+#nthotago_crop <- readRDS("Maxent/Regional_rasters/nthotago_final")
+saveRDS(otago_crop, "Maxent/Regional_rasters/otago_final")
+#otago_crop <- readRDS("Maxent/Regional_rasters/otago_final")
+saveRDS(catlins_crop, "Maxent/Regional_rasters/catlins_final")
+#catlins_crop <- readRDS("Maxent/Regional_rasters/catlins_final")
+saveRDS(stewart_crop, "Maxent/Regional_rasters/stewart_final")
+#stewart_crop <- readRDS("Maxent/Regional_rasters/stewart_final")
+
+# Cropping env predictor rasters of SI extent to regional extent- prediction layers (distance to all nest sites)
+banks_pred <- crop(final_layers_pred, banks_poly)
+nthotago_pred <- crop(final_layers_pred, nthotago_poly)
+otago_pred <- crop(final_layers_pred, otago_poly)
+catlins_pred <- crop(final_layers_pred, catlins_poly)
+stewart_pred <- crop(final_layers_pred, stewart_poly)
+
+# Saving regional raster brick as RDS file
+saveRDS(banks_pred, "Maxent/Regional_rasters/banks_finalpred")
+#banks_pred <- readRDS("Maxent/Regional_rasters/banks_finalpred")
+saveRDS(nthotago_pred, "Maxent/Regional_rasters/nthotago_finalpred")
+#nthotago_pred <- readRDS("Maxent/Regional_rasters/nthotago_finalpred")
+saveRDS(otago_pred, "Maxent/Regional_rasters/otago_finalpred")
+#otago_pred <- readRDS("Maxent/Regional_rasters/otago_finalpred)
+saveRDS(catlins_pred, "Maxent/Regional_rasters/catlins_finalpred")
+#catlins_pred <- readRDS("Maxent/Regional_rasters/catlins_finalpred")
+saveRDS(stewart_pred, "Maxent/Regional_rasters/stewart_finalpred")
+#stewart_pred <- readRDS("Maxent/Regional_rasters/stewart_finalpred")
+```
+
+#### Creating 10,000 background points, entire SI extent; 
+```{r}
+# Creating background points from entire SI extent
+bg <- randomPoints(final_layers[[1]], n = 11000, p = sp_all)
+bg <- as.data.frame(bg)
+bg_count <- pointcount(fishnet, bg) # rasterizing bg points
+bg_extract <- raster::extract(final_layers, bg, df = TRUE) 
+bg_extract <- bg_extract %>%
+  mutate(species = "bg", longitude = bg$x, latitude = bg$y) %>%
+  dplyr:: select(species, longitude, latitude, bathymetry:turb_mean) %>%
+  drop_na()
+bg_extract <- bg_extract[1:10000,]
+write.csv(bg_extract, "Maxent/Background_10000pt_SIextent.csv", row.names = FALSE)
+#bg_extract <- read.csv("Maxent/Background_10000pt_SIextent.csv")
+
+ext1_all2 <- ext1_all[c(1:3, 10, 12, 15:18, 20, 26, 32)]
+ext1_all2 <- mutate(ext1_all2, species = "1", .before = 1)
+names(ext1_all2) <- names(bg_extract)
+bg_extract$species <- "0"
+p_allextract <- rbind(bg_extract, ext1_all2)
+p_allextract2 <- p_allextract
+coordinates(p_allextract2) <- ~longitude+latitude
+crs(p_allextract2) <- nztm
+p_allextract2 <- spTransform(p_allextract2, wgs)
+writeOGR(p_allextract2, dsn = "Maxent", drive = "ESRI Shapefile", layer = "prbg_SIextent")
+
+write.csv(p_allextract, "Maxent/prbg_SIextent_envextract.csv", row.names = FALSE)
+p_allextract<- read.csv("Maxent/prbg_SIextent_envextract.csv")
+
+```
+
+#### Creating 10,000 background points, regional extent
+```{r}
+# Banks Peninsula
+bg_banks <- randomPoints(banks_crop[[1]], n = 6000, p = sp_banks)
+bg_banks <- as.data.frame(bg_banks)
+bg_count_banks <- pointcount(banks_crop[[1]], bg_banks) # rasterizing bg_banks points
+bg_extract_banks <- raster::extract(banks_crop, bg_banks, df = TRUE) 
+bg_extract_banks <- bg_extract_banks %>%
+  mutate(species = "bg", longitude = bg_banks$x, latitude = bg_banks$y) %>%
+  dplyr::select(species, longitude, latitude, bathymetry:turb_mean) %>%
+  drop_na()
+bg_extract_banks <- bg_extract_banks[1:5000,]
+
+write.csv(bg_extract_banks, "Maxent/Background_5000pt_banks.csv", row.names = FALSE)
+#bg_extract_banks <- read.csv("Maxent/Background_5000pt_banks.csv")
+
+# North Otago
+bg_nthotago <- randomPoints(nthotago_crop[[1]], n = 6000, p = sp_nthotago)
+bg_nthotago <- as.data.frame(bg_nthotago)
+bg_count_nthotago <- pointcount(nthotago_crop[[1]], bg_nthotago) # rasterizing bg_nthotago points
+bg_extract_nthotago <- raster::extract(nthotago_crop, bg_nthotago, df = TRUE) 
+bg_extract_nthotago <- bg_extract_nthotago %>%
+  mutate(species = "bg", longitude = bg_nthotago$x, latitude = bg_nthotago$y) %>%
+  dplyr::select(species, longitude, latitude, bathymetry:turb_mean) %>%
+  drop_na()
+bg_extract_nthotago <- bg_extract_nthotago[1:5000,]
+
+write.csv(bg_extract_nthotago, "Maxent/Background_5000pt_nthotago.csv", row.names = FALSE)
+#bg_extract_nthotago <- read.csv("Maxent/Background_5000pt_nthotago.csv")
+
+# Otago
+bg_otago <- randomPoints(otago_crop[[1]], n = 6000, p = sp_otago, lonlatCorrection = T)
+bg_otago <- as.data.frame(bg_otago)
+bg_count_otago <- pointcount(otago_crop[[1]], bg_otago) # rasterizing bg_otago points
+bg_extract_otago <- raster::extract(otago_crop, bg_otago, df = TRUE) 
+bg_extract_otago <- bg_extract_otago %>%
+  mutate(species = "bg", longitude = bg_otago$x, latitude = bg_otago$y) %>%
+  dplyr::select(species, longitude, latitude, bathymetry:turb_mean) %>%
+  drop_na()
+bg_extract_otago <- bg_extract_otago[1:5000,]
+
+write.csv(bg_extract_otago, "Maxent/Background_5000pt_otago.csv", row.names = FALSE)
+#bg_extract_otago <- read.csv("Maxent/Background_5000pt_otago.csv")
+
+# Catlins
+bg_catlins <- randomPoints(catlins_crop[[1]], n = 6000, p = sp_catlins)
+bg_catlins <- as.data.frame(bg_catlins)
+bg_count_catlins <- pointcount(catlins_crop[[1]], bg_catlins) # rasterizing bg_catlins points
+bg_extract_catlins <- raster::extract(catlins_crop, bg_catlins, df = TRUE) 
+bg_extract_catlins <- bg_extract_catlins %>%
+  mutate(species = "bg", longitude = bg_catlins$x, latitude = bg_catlins$y) %>%
+  dplyr::select(species, longitude, latitude, bathymetry:turb_mean) %>%
+  drop_na()
+bg_extract_catlins <- bg_extract_catlins[1:5000,]
+
+write.csv(bg_extract_catlins, "Maxent/Background_5000pt_catlins.csv", row.names = FALSE)
+#bg_extract_catlins <- read.csv("Maxent/Background_5000pt_catlins.csv")
+
+# Stewart Island
+bg_stewart <- randomPoints(stewart_crop[[1]], n = 6000, p = sp_stewart)
+bg_stewart <- as.data.frame(bg_stewart)
+bg_count_stewart <- pointcount(stewart_crop[[1]], bg_stewart) # rasterizing bg_stewart points
+bg_extract_stewart <- raster::extract(stewart_crop, bg_stewart, df = TRUE) 
+bg_extract_stewart <- bg_extract_stewart %>%
+  mutate(species = "bg", longitude = bg_stewart$x, latitude = bg_stewart$y) %>%
+  dplyr::select(species, longitude, latitude, bathymetry:turb_mean) %>%
+  drop_na()
+bg_extract_stewart <- bg_extract_stewart[1:5000,]
+
+write.csv(bg_extract_stewart, "Maxent/Background_5000pt_stewart.csv", row.names = FALSE)
+#bg_extract_stewart <- read.csv("Maxent/Background_10000pt_stewart.csv")
+```
+
+#### Extract final layers to presence/absence points
+```{r}
+extpr <- function(x, pr, nam){
+  ext1_reg <- raster::extract(x, pr)
+  ext1_reg <- data.frame(pr@coords, ext1_reg)
+  names(ext1_reg)[1] <- "longitude"
+  names(ext1_reg)[2] <- "latitude"
+  write.csv(ext1_reg, paste("Maxent/Filtered/", nam, "_1hr_extractenvar.csv", sep = ""), row.names = FALSE)
+  assign(paste("ext1", nam, "presence", sep = "_"), ext1_reg, envir = .GlobalEnv)
+}
+
+extpr(x = banks_crop, pr = sp1_banks, nam = "banks")
+banks_all <- rbind(cbind("species" = "pr", ext1_banks_presence), bg_extract_banks)
+extpr(x = nthotago_crop, pr = sp1_nthotago, nam = "nthotago")
+nthotago_all <- rbind(cbind("species" = "pr", ext1_nthotago_presence), bg_extract_nthotago)
+extpr(x = otago_crop, pr = sp1_otago, nam = "otago")
+otago_all <- rbind(cbind("species" = "pr", ext1_otago_presence), bg_extract_otago)
+extpr(x = catlins_crop, pr = sp1_catlins, nam = "catlins")
+catlins_all <- rbind(cbind("species" = "pr", ext1_catlins_presence), bg_extract_catlins)
+extpr(x = stewart_crop, pr = sp1_stewart, nam = "stewart")
+stewart_all <- rbind(cbind("species" = "pr", ext1_stewart_presence), bg_extract_stewart)
+```
+
+### SECTION 4: REGIONAL MESS
+<!-- ###################### MESS ########################################### -->
+***
+### Compute multivariate environmental similarity surfaces (MESS), as described by Elith et al., 2010
+#### anything <0 indicates dissimilarity
+```{r}
+library(modEvA)
+ext1_all
+# This creates a dataframe with MESS values/env predictor, total MESS value, and MoD which indicates env pred that correspondes to the most dissimilar variable (ie. limiting factor)
+otago_mess <- MESS(P = rasbind[c(3, 10, 12, 15:18, 21, 26, 32)], V = otago_all[3:12])
+# This creates a raster with MESS values
+otago_messras <- mess(final_layers, otago_all[3:12])
+plot(otago_messras)
+plot(otago_messras<0)
+
+banks_messras <- mess(final_layers, banks_all[3:12])
+plot(banks_messras)
+plot(banks_messras<0)
+
+catlins_messras <- mess(final_layers, catlins_all[3:12])
+plot(catlins_messras)
+plot(catlins_messras<0)
+
+nthotago_messras <- mess(final_layers, nthotago_all[3:12])
+plot(nthotago_messras)
+plot(nthotago_messras<0)
+
+stewart_messras <- mess(final_layers, stewart_all[3:12])
+plot(stewart_messras)
+plot(stewart_messras<0)
+```
+
+### SECTION 5: SI MODEL
+<!-- ###################### ENMeval ######################################## -->
+***
+#### Dataset: 1 point/hour, no thinning
+# Running Maxent models through dismo in parallel with spatially segregated cross-validations, all feature classes
+
+##### k-fold cross validation (see ENMEval vignette)
+##### three partitioning methods:  variations of ‘masked geographically structured’ data partitioning (adosavljevic and Anderson, 2014). "Partition both occurrence records and background points into evaluation bins based on some spatial rules".
+##### Checkerboard2 -> k=4 bins; aggregating the input raster at two scales
+
+#### For dataset of 1 point/hour, k fold cross validation folds determined using the checkerboard2 method for presence and background points; saved 
+```{r}
+set.seed(10)
+occs <- pt1_all[2:3]
+check2 <- get.checkerboard2(occs, final_layers, bg, aggregation.factor=c(5,5))
+plot(nz)
+points(bg, pch=21, bg=check2$bg.grp)
+points(occs, pch=21, bg=check2$occ.grp, col='white', cex=1.5)
+
+saveRDS(check2, "Maxent/Filtered/Partitioncheckerboard2_presback_1hr.csv")
+```
+
+#### Running ENMevaluate
+```{r}
+# Using user method to test/train model; kfold validation using checkerboard2 sampling
+# Regularization 1-10, 5 possible feature classes
+enm_1hr <- ENMevaluate(pt1_all[2:3], 
+                       final_layers,
+                       bg.coords = bg, 
+                       #occ.grp = occ_kmean, 
+                       #bg.grp = occ_kmean_bg, 
+                       #method = "user",
+                       #method = "randomkfold", 
+                       #kfolds = 5, 
+                       method = "checkerboard2",
+                       RMvalues = c(seq(1, 5, 1), seq(6, 15, 0.5)),
+                       fc = c("L", "LQ", "LQH", "LQHP", "LQHPT"),
+                       parallel = TRUE,
+                       rasterPreds = TRUE,
+                       algorithm = "maxent.jar",
+                       clamp = FALSE, 
+                       progbar = TRUE, 
+                       bin.output = TRUE)
+
+saveRDS(enm_1hr, "Maxent/ENMeval/bestevalmodel_1hr")
+#enm_1hr <- readRDS("Maxent/ENMeval/bestevalmodel_1hr")
+beep(1)
+
+# Evaluating output
+enm_1hr_results <- data.frame(enm_1hr@results)
+
+#Isolates model with the lowest AICc - ENMeval output
+min_AIC <- enm_1hr_results[enm_1hr_results$AICc == min(enm_1hr_results$AICc, 
+                                                       na.rm = TRUE),]
+min_AIC <- min_AIC[!is.na(min_AIC$settings),]
+i <- which(enm_1hr_results$AICc == min(enm_1hr_results$AICc, 
+                                       na.rm = TRUE))
+
+#Isolates model with the lowest AICc - MAXENT output
+aic.opt <- enm_1hr@models[[which(enm_1hr@results$AICc == min(enm_1hr@results$AICc,
+                                                             na.rm = TRUE))]]
+maxent_results <- aic.opt@results
+maxent_varimport <- var.importance(aic.opt) # df of % contribution, perm import.
+
+#Isolates model with the highest test AUC
+max_AUC <- enm_1hr_results[enm_1hr_results$avg.test.AUC == 
+                             max(enm_1hr_results$avg.test.AUC, 
+                                 na.rm = TRUE), ] 
+j <- which(enm_1hr_results$avg.test.AUC == max(enm_1hr_results$avg.test.AUC, 
+                                               na.rm = TRUE))
+min_AIC
+max_AUC
+
+# Comparing niche space overlap across parameter variations
+noverlap_1hr <- calc.niche.overlap(enm_1hr@predictions, stat="D")
+corrplot(noverlap_1hr, method = "square", type = "upper", 
+         order = "alphabet", number.cex = 0.2, tl.cex = 0.5,
+         tl.col = "black", tl.srt = 90)
+
+# Make prediction using the best model (minimum AICc)
+pr_1hr <- predict(final_layers, enm_1hr@models[[i]], type = 'cloglog')
+pr_df1hr <- as.data.frame(pr_1hr, xy = T)
+#pr_1hr_auc <- predict(final_layers, enm_1hr@models[[j]], type = 'cloglog')
+#pr_df1hr_auc <- as.data.frame(pr_1hr_auc, xy = T)
+
+# Heatmap 
+ggplot() +
+  geom_raster(data = pr_df1hr, aes(x = x, y = y, fill = layer)) +
+  #geom_point(data = pt1_all[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  #coord_quickmap() +
+  theme_bw() + 
+  scale_fill_gradientn(colours = c("white", "purple", "orange", "yellow"), 
+                       values = c(0, 0.1, 0.5, 1), na.value = "white")
+
+#Examining occurrence rate outputs
+par(mfrow = c(2,1))
+plot(enm_1hr@predictions[[which(enm_1hr@results$delta.AICc == 0)]],
+     main = "Relative occurrence rate AICc")
+plot(enm_1hr@predictions[[which(enm_1hr@results$avg.test.AUC == 
+                                  max(enm_1hr@results$avg.test.AUC))]],
+     main = "Relative occurrence rate AUC")
+
+# Evaluation plots
+par(mfrow = c(4,1))
+eval.plot(enm_1hr@results, 
+          "AICc", legend = TRUE)
+eval.plot(enm_1hr@results,
+          "train.AUC", legend = FALSE)
+eval.plot(enm_1hr@results,
+          "avg.test.AUC", var = "var.test.AUC", legend = FALSE)
+eval.plot(enm_1hr@results, 
+          "avg.test.orMTP", var = "var.test.orMTP")
+eval.plot(enm_1hr@results, 
+          "avg.test.or10pct", var = "var.test.or10pct", legend = FALSE)
+eval.plot(enm_1hr@results, 
+          "avg.diff.AUC", var = "var.diff.AUC", legend = FALSE)
+
+# Saving dataframe of all ENMeval candidate model results
+write.csv(enm_1hr_results, "Maxent/ENMeval/enmeval_allmod_1hr_results.csv", 
+          row.names = FALSE)
+#enm_1hr_results <- read.csv("Maxent/ENMeval/enmeval_allmod_1hr_results.csv")
+
+```
+
+#### Choosing best ENMeval model (based on 4 evaluation metrics)
+```{r}
+# Isolates LQHP_7.5 ENMeval output
+min_AIC <- enm_1hr_results[enm_1hr_results$settings == "LQHP_7.5",]
+i <- which(enm_1hr_results$settings == "LQHP_7.5")
+
+# Isolates model with the lowest AICc - MAXENT output
+aic.opt <- enm_1hr@models[[which(enm_1hr@results$settings == "LQHP_7.5")]]
+maxent_results <- aic.opt@results
+maxent_varimport <- var.importance(aic.opt) # df of % contribution, perm import.
+
+final_eval <- dismo::evaluate(p = pt1_all[2:3], a = bg, x = final_layers, model = aic.opt)
+tr <- threshold(final_eval, 'spec_sens')
+
+# Parsing lambdas to get min/max etc.
+lambda <- parse_lambdas(aic.opt)
+feature <- c("linearPredictorNormalizer", "densityNormalizer", "numBackgroundPoints", "entropy")
+xx <- c(lambda$linearPredictorNormalizer, lambda$densityNormalizer, lambda$numBackgroundPoints, lambda$entropy)
+xx <- data.frame("feature" = feature, "var" = feature, "lambda" = xx, "min" = 0, "max" = 0, "type" = "none")
+lambda <- data.frame(lambda$lambdas)
+lambda <- rbind(lambda, xx)
+
+# Make prediction using the best model (minimum AICc)
+pr_1hr <- predict(final_layers, enm_1hr@models[[i]], type = 'cloglog')
+pr_df1hr <- as.data.frame(pr_1hr, xy = TRUE)
+
+# Saving results for the best/final model
+saveRDS(aic.opt, "Maxent/ENMeval/maxent_bestmod_1hr.rds")
+#final_mod <- readRDS("Maxent/ENMeval/maxent_bestmod_1hr.rds")
+write.csv(maxent_results, "Maxent/ENMeval/maxent_bestmod_1hr_results.csv", 
+          row.names = FALSE) # final, best model
+#final_results <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_results.csv")
+write.csv(pr_df1hr, "Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions.csv", 
+          row.names = FALSE) # df of predictions, cloglog
+#final_predictdf <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions.csv")
+write.csv(lambda, "Maxent/ENMeval/maxent_bestmod_1hr_lambdas.csv", 
+          row.names = FALSE)
+#final_lambda <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_lambdas.csv")
+saveRDS(pr_1hr, "Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog.rds")
+#final_predictraster <- readRDS("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog.rds")
+
+# # ENMeval saves all outputs to a temp folder; moving temp folder to Maxent/ENMeval in wd
+# # Checking if ENMeval_bestmod folder exists in the Maxent/ENMeval folder
+# # If not, creates new folder
+# new_path <- file.path(parent, "Maxent/ENMeval/ENMeval_bestmod")
+# if (!dir.exists(new_path)) {dir.create(new_path)} 
+# 
+# # Moves temp folder to new folder
+# old_path <- aic.opt@path
+# current_files <- list.files(old_path, full.names = TRUE)
+# file.copy(from = current_files, to = new_path, 
+#           overwrite = recursive, recursive = FALSE, copy.mode = TRUE)
+```
+
+<!-- ###################### SOUTH ISLAND FINAL MODEL ####################### -->
+***
+### Running Maxent using the RM and FC values determined above
+#### Stepwise removal of variables; AICc DID NOT IMPROVE WITH THE REMOVAL OF ENV VARIABLE WITH THE LOWEST PERMUTATION IMPORTANCE; abort
+#### Final model created in dismo 
+```{r}
+# Best/final model: All variables, regularization = 7.5, feature class = LQHP, 30/70 holdout
+
+# Maxent arguments
+args_m <- c(#"maximumbackground=10000", "defaultprevalence=1.00",
+  #"pictures=true", #"threads=2", #"responsecurves=false",
+  #"jackknife=false", #"askoverwrite=false",
+  "betamultiplier=7.5", "randomtestpoints=30", "linear=true", "quadratic=true", 
+  "product=true", "threshold=false", "hinge=true", "plots=true")
+
+best_mod <- maxent(x = final_layers, 
+                   p = pt1_all[2:3], 
+                   a = bg, 
+                   args = args_m,
+                   path = "Maxent/Dismo/SImodel") # Make sure this folder has been created 
+
+best_results <- best_mod@results # already saved as Dismo/SImodel/maxentResults.csv
+best_eval <- dismo::evaluate(p = pt1_all[2:3], a = bg, x = final_layers, model = best_mod)
+#best_response <- response(best_mod)
+best_predict <- dismo::predict(x = final_layers, object = best_mod, type = "cloglog")
+best_predictdf <- as.data.frame(best_predict, xy = TRUE)
+best_varimport <- var.importance(best_mod) # df of % contribution, perm import.
+maxent_varimport <- best_varimport # for easy plotting later
+
+# Parsing lambdas to get min/max etc.
+lambda <- parse_lambdas(best_mod)
+feature <- c("linearPredictorNormalizer", "densityNormalizer", "numBackgroundPoints", "entropy")
+xx <- c(lambda$linearPredictorNormalizer, lambda$densityNormalizer, lambda$numBackgroundPoints, lambda$entropy)
+xx <- data.frame("feature" = feature, "var" = feature, "lambda" = xx, "min" = 0, "max" = 0, "type" = "none")
+lambda <- data.frame(lambda$lambdas)
+lambda <- rbind(lambda, xx)
+
+# Thresholding
+tr <- threshold(best_eval, 'spec_sens') # AKA MSS Maximum Sum of Sensitivity and Specificity
+pr_ras <- best_predict
+pr_ras[pr_ras<tr] <- NA
+pr_ras[!is.na(pr_ras)] <- 1
+pr_thr <- as.data.frame(best_predict>tr, xy = TRUE)
+pol <- rasterToPolygons(pr_ras, fun = function(x){x== 1}, dissolve = TRUE)
+
+# Saving results for the best/final model
+saveRDS(best_mod, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_SI.rds")
+#best_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_SI.rds")
+write.csv(best_results, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_results_SI.csv", 
+          row.names = TRUE) # final, best model
+#best_results <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_results_SI.csv")
+write.csv(best_predictdf, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_SI.csv", 
+          row.names = FALSE) # df of predictions, cloglog
+#best_predictdf <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_SI.csv")
+write.csv(lambda, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_lambdas_SI.csv", 
+          row.names = FALSE)
+#lambda <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_lambdas_SI.csv")
+saveRDS(best_predict, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_SI.rds")
+#best_predict <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_SI.rds")
+
+write.csv(pr_thr, "Maxent/Dismo/SImodel/maxent_bestmod_thresholdMSS.csv", row.names = FALSE)
+#pr_thr <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_thresholdMSS.csv")
+writeOGR(pol, dsn = "Maxent/Dismo/SImodel", drive = "ESRI Shapefile", layer = "thresholdMSS_polygon")
+pol <- shapefile("Maxent/Dismo/SImodel/thresholdMSS_polygon.shp")
+```
+
+#### SI model, using distnest for fitting and distnestall for predictions
+```{r}
+#best_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_SI.rds")
+best_predict_col <- dismo::predict(x = final_layers_pred, object = best_mod, type = "cloglog")
+best_predictdf_col <- as.data.frame(best_predict_col, xy = TRUE)
+
+# Thresholding
+tr <- threshold(best_eval, 'spec_sens') # AKA MSS Maximum Sum of Sensitivity and Specificity
+pr_ras <- best_predict_col
+pr_ras[pr_ras<tr] <- NA
+pr_ras[!is.na(pr_ras)] <- 1
+pr_thr <- as.data.frame(best_predict_col>tr, xy = TRUE)
+pol <- rasterToPolygons(pr_ras, fun = function(x){x== 1}, dissolve = TRUE)
+
+# Saving results for the best/final model
+write.csv(best_predictdf_col, 
+          "Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_allcol_SI.csv",
+          row.names = FALSE) # df of predictions, cloglog
+#best_predictdf_col <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_allcol_SI.csv")
+saveRDS(best_predict_col, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_allcol_SI.rds")
+#best_predict_col <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_allcol_SI.rds")
+
+write.csv(pr_thr, "Maxent/Dismo/SImodel/maxent_bestmod_thresholdMSS.csv", row.names = FALSE)
+#pr_thr <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_thresholdMSS.csv")
+writeOGR(pol, dsn = "Maxent/Dismo/SImodel", drive = "ESRI Shapefile", layer = "thresholdMSS_polygon", overwrite_layer = TRUE)
+#pol <- shapefile("Maxent/Dismo/SImodel/thresholdMSS_polygon.shp")
+writeRaster(best_predict_col, "Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog.tif", overwrite = TRUE)
+```
+
+#### SI model, no distnest 
+##### Same RM and FC as SI model with distnest
+```{r}
+# Best/final model: All variables, regularization = 7.5, feature class = LQHP, 30/70 holdout
+
+# Removing distnest from final_layers
+final_layers_nodist <- dropLayer(final_layers, 3)
+
+# Maxent arguments
+args_m <- c("betamultiplier=7.5", "randomtestpoints=30", "linear=true", "quadratic=true", 
+            "product=true", "threshold=false", "hinge=true", "plots=true")
+
+best_nodist_mod <- maxent(x = final_layers_nodist, 
+                          p = pt1_all[2:3], 
+                          a = bg, 
+                          args = args_m,
+                          path = "Maxent/Dismo/SImodel/Nodist") # Make sure this folder has been created 
+
+best_nodist_results <- best_nodist_mod@results # already saved as Dismo/SImodel/Nodist/maxentResults.csv
+best_nodist_eval <- dismo::evaluate(p = pt1_all[2:3], 
+                                    a = bg, 
+                                    x = final_layers_nodist, 
+                                    model = best_nodist_mod)
+#best_nodist_response <- response(best_nodist_mod)
+best_nodist_predict <- dismo::predict(x = final_layers_nodist, object = best_nodist_mod, arg = c("outputformat=cloglog"))
+#best_nodist_predict <- dismo::predict(x = final_layers_nodist, object = best_nodist_mod, arg = c("outputformat=raw"))
+best_nodist_predictdf <- as.data.frame(best_nodist_predict, xy = TRUE)
+best_nodist_varimport <- var.importance(best_nodist_mod) # df of % contribution, perm import.
+maxent_varimport_nodist <- best_nodist_varimport # for easy plotting later
+
+# Parsing lambdas to get min/max etc.
+lambda <- parse_lambdas(best_nodist_mod)
+feature <- c("linearPredictorNormalizer", "densityNormalizer", "numBackgroundPoints", "entropy")
+xx <- c(lambda$linearPredictorNormalizer, lambda$densityNormalizer, lambda$numBackgroundPoints, lambda$entropy)
+xx <- data.frame("feature" = feature, "var" = feature, "lambda" = xx, "min" = 0, "max" = 0, "type" = "none")
+lambda <- data.frame(lambda$lambdas)
+lambda <- rbind(lambda, xx)
+
+# Thresholding
+tr_nd <- threshold(best_nodist_eval, 'spec_sens') # AKA MSS Maximum Sum of Sensitivity and Specificity
+pr_thr_nodist <- as.data.frame(best_nodist_predict>tr_nd, xy=TRUE)
+pr_ras_nodist <- best_nodist_predict
+pr_ras_nodist[pr_ras_nodist<tr_nd] <- NA
+pr_ras_nodist[!is.na(pr_ras_nodist)] <- 1
+pol_nodist <- rasterToPolygons(pr_ras_nodist, fun = function(x){x== 1}, dissolve = TRUE)
+
+# Saving results for the best/final model
+saveRDS(best_nodist_mod, "Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_SI.rds")
+#best_nodist_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_SI.rds")
+write.csv(best_nodist_results, 
+          "Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_results_SI.csv", 
+          row.names = TRUE) # final, best model
+#best_nodist_results <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_results_SI.csv")
+write.csv(best_nodist_predictdf,
+          "Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_dfpredictions_SI.csv", 
+          row.names = FALSE) # df of predictions, cloglog
+#best_nodist_predictdf <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_dfpredictions_SI.csv")
+write.csv(lambda, "Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_lambdas_SI.csv", 
+          row.names = FALSE)
+#lambda <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_lambdas_SI.csv")
+saveRDS(best_nodist_predict, "Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_rastercloglog_SI.rds")
+#best_nodist_predict <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_rastercloglog_SI.rds")
+
+writeRaster(best_nodist_predict, "Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_rastercloglog.tif", overwrite = TRUE)
+
+write.csv(pr_thr_nodist, "Maxent/Dismo/SImodel/maxent_bestmod_nodist_thresholdMSS.csv", row.names = FALSE)
+#pr_thr_nodist <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_thresholdMSS.csv")
+writeOGR(pol_nodist, dsn = "Maxent/Dismo/SImodel", drive = "ESRI Shapefile", layer = "thresholdMSS_nodist_polygon", overwrite_layer = TRUE)
+#pol_nodist <- shapefile("Maxent/Dismo/SImodel/thresholdMSS_nodist_polygon.shp")
+```
+
+#### Niche comparision between dist and no dist predictions using Schoener's D
+```{r}
+noa <- nicheOverlap(best_predict_col, best_nodist_predict, "D")
+```
+
+### SECTION 6: REGIONAL MODEL
+<!-- ###################### ENMeval ######################################## -->
+***
+#### Dataset: 1 point/hour, no thinning
+# Running Maxent models through dismo in parallel with spatially segregated cross-validations, all feature classes
+```{r}
+############# THIS CHANGES EACH TIME! COMMENT/UNCOMMENT AS APPROPRIATE #########
+# To remove all variables created after the first reload chunks
+.startvar2 <- ls()
+.startvar_rm <- setdiff(.startvar2, .startvar)
+rm(list = .startvar_rm)
+
+region <- "otago"
+region <- "nthotago"
+region <- "catlins"
+region <- "banks"
+region <- "stewart"
+
+region2 <- "Otago"
+region2 <- "North Otago"
+region2 <- "Catlins"
+region2 <- "Banks Peninsula"
+region2 <- "Stewart Island"
+
+season <- "all" 
+
+final_layers_r <- get(paste(region, "crop", sep = "_"))
+final_layers_r_pred <- get(paste(region, "pred", sep = "_"))
+final_layers_r_nodist <- dropLayer(final_layers_r, 3)
+pt1_r <- get(paste("pt1", region, sep = "_"))
+bg_r <- get(paste("bg", region, sep = "_"))
+
+# For north otago...
+final_layers_r$currents[final_layers_r$currents > 0.3] <- NA
+final_layers_r_nodist$currents[final_layers_r_nodist$currents > 0.3] <- NA
+
+################################################################################
+set.seed(10)
+occs <- pt1_r[2:3]
+check2 <- get.checkerboard2(occs, final_layers_r, bg_r, aggregation.factor = c(5,5))
+plot(nz)
+points(bg_r, pch = 21, bg = check2$bg.grp)
+points(occs, pch = 21, bg = check2$occ.grp, col = 'white', cex = 1.5)
+saveRDS(check2, paste("Maxent/Filtered/Partitioncheckerboard2_presback_1hr_", region, ".csv", sep = ""))
+#check2 <- readRDS(paste("Maxent/Filtered/Partitioncheckerboard2_presback_1hr_", region, ".csv", sep = ""))
+```
+
+```{r}
+# Using user method to test/train model; kfold validation using checkerboard2 sampling
+# Regularization 1-10, 5 possible feature classes
+enm_1hr <- ENMevaluate(pt1_r[2:3], 
+                       final_layers_r,
+                       bg.coords = bg_r, 
+                       method = "checkerboard2",
+                       RMvalues = c(seq(1, 5, 1), seq(6, 15, 0.5)),
+                       fc = c("L", "LQ", "LQH", "LQHP", "LQHPT"),
+                       parallel = TRUE,
+                       rasterPreds = TRUE,
+                       algorithm = "maxent.jar",
+                       clamp = FALSE, 
+                       progbar = TRUE, 
+                       bin.output = TRUE)
+beep(1)
+
+saveRDS(enm_1hr, paste("Maxent/ENMeval/bestevalmodel_1hr_", region, sep = ""))
+#enm_1hr <- readRDS(paste("Maxent/ENMeval/bestevalmodel_1hr_", region, sep = ""))
+
+# Evaluating output
+enm_1hr_results <- data.frame(enm_1hr@results)
+
+# Saving dataframe of all ENMeval candidate model results
+write.csv(enm_1hr_results, paste("Maxent/ENMeval/enmeval_allmod_1hr_results_", 
+                                 region, ".csv", sep = ""), 
+          row.names = FALSE)
+#enm_1hr_results <- read.csv(paste("Maxent/ENMeval/enmeval_allmod_1hr_results_", region, ".csv", sep = ""))
+
+#Isolates model with the lowest AICc - ENMeval output
+min_AIC <- enm_1hr_results[enm_1hr_results$AICc == min(enm_1hr_results$AICc, 
+                                                       na.rm = TRUE),]
+min_AIC <- min_AIC[!is.na(min_AIC$settings),]
+i <- which(enm_1hr_results$AICc == min(enm_1hr_results$AICc, 
+                                       na.rm = TRUE))
+
+#Isolates model with the lowest AICc - MAXENT output
+aic.opt <- enm_1hr@models[[which(enm_1hr@results$AICc == min(enm_1hr@results$AICc,
+                                                             na.rm = TRUE))]]
+maxent_results <- aic.opt@results
+maxent_varimport <- var.importance(aic.opt) # df of % contribution, perm import.
+
+min_AIC
+
+# Comparing niche space overlap across parameter variations
+#noverlap_1hr <- calc.niche.overlap(enm_1hr@predictions, stat="D")
+#corrplot(noverlap_1hr, method = "square", type = "upper", 
+#         order = "alphabet", number.cex = 0.2, tl.cex = 0.5,
+#         tl.col = "black", tl.srt = 90)
+
+# Evaluation plots
+par(mfrow = c(4,1))
+eval.plot(enm_1hr@results, 
+          "AICc", legend = TRUE)
+eval.plot(enm_1hr@results,
+          "train.AUC", legend = FALSE)
+eval.plot(enm_1hr@results,
+          "avg.test.AUC", var = "var.test.AUC", legend = FALSE)
+eval.plot(enm_1hr@results, 
+          "avg.test.orMTP", var = "var.test.orMTP")
+eval.plot(enm_1hr@results, 
+          "avg.test.or10pct", var = "var.test.or10pct", legend = FALSE)
+eval.plot(enm_1hr@results, 
+          "avg.diff.AUC", var = "var.diff.AUC", legend = FALSE)
+
+# Make prediction using the best model (minimum AICc)
+pr_1hr <- predict(final_layers_r, enm_1hr@models[[i]], type = 'cloglog')
+pr_df1hr <- as.data.frame(pr_1hr, xy = T)
+
+# Heatmap 
+ggplot() +
+  coord_cartesian(xlim = c(xmin(pr_1hr), xmax(pr_1hr)), ylim= c(ymin(pr_1hr), ymax(pr_1hr)), expand = FALSE) + 
+  geom_raster(data = as.data.frame(pr_1hr, xy=T), aes(x = x, y = y, fill = layer)) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish)
+
+#Examining occurrence rate outputs
+par(mfrow = c(2,1))
+plot(enm_1hr@predictions[[which(enm_1hr@results$delta.AICc == 0)]],
+     main = "Relative occurrence rate AICc")
+plot(enm_1hr@predictions[[which(enm_1hr@results$avg.test.AUC == 
+                                  max(enm_1hr@results$avg.test.AUC))]],
+     main = "Relative occurrence rate AUC")
+```
+
+#### Choosing best ENMeval model (based on 4 evaluation metrics)
+```{r}
+############# THIS CHANGES FOR EACH REGION  ####################################
+regfc <- "LQHPT_7" # otago 
+regfc <- "LQ_5" # nth otago (lowest AIC was LQH14.5)
+regfc <- "LQ_1" # catlins (lowest AIC was LQ1)
+regfc <- "LQ_4" # banks (lowest AIC was LQ4)
+regfc <- "LQH_12.5" # stewart (lowest AIC was LQHPT15)
+
+################################################################################
+# Redo with new "best model"
+
+# Isolates ENMeval output
+min_AIC <- enm_1hr_results[enm_1hr_results$settings == regfc,]
+i <- which(enm_1hr_results$settings == regfc)
+
+# Isolates model with the lowest AICc - MAXENT output
+aic.opt <- enm_1hr@models[[which(enm_1hr@results$settings == regfc)]]
+maxent_results <- aic.opt@results
+maxent_varimport <- var.importance(aic.opt) # df of % contribution, perm import.
+
+final_eval <- dismo::evaluate(p = pt1_r[2:3], a = bg_r, x = final_layers_r, model = aic.opt)
+tr <- threshold(final_eval, 'spec_sens')
+
+# Parsing lambdas to get min/max etc.
+lambda <- parse_lambdas(aic.opt)
+feature <- c("linearPredictorNormalizer", "densityNormalizer", "numBackgroundPoints", "entropy")
+xx <- c(lambda$linearPredictorNormalizer, lambda$densityNormalizer, lambda$numBackgroundPoints, lambda$entropy)
+xx <- data.frame("feature" = feature, "var" = feature, "lambda" = xx, "min" = 0, "max" = 0, "type" = "none")
+lambda <- data.frame(lambda$lambdas)
+lambda <- rbind(lambda, xx)
+
+# Make prediction using the best model (minimum AICc)
+pr_1hr <- predict(final_layers_r, enm_1hr@models[[i]], type = 'cloglog')
+pr_df1hr <- as.data.frame(pr_1hr, xy = TRUE)
+
+# Saving results for the best/final model
+saveRDS(aic.opt, paste("Maxent/ENMeval/maxent_bestmod_1hr_", region, sep = ""))
+write.csv(maxent_results, paste("Maxent/ENMeval/maxent_bestmod_1hr_results_", 
+                                region, ".csv", sep = ""), 
+          row.names = TRUE) # final, best model
+write.csv(pr_df1hr, paste("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions_", 
+                          region, ".csv", sep = ""), 
+          row.names = FALSE) # df of predictions, cloglog
+write.csv(lambda, paste("Maxent/ENMeval/maxent_bestmod_1hr_lambdas_", 
+                        region, ".csv", sep = ""), 
+          row.names = FALSE)
+saveRDS(pr_1hr, paste("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog_", 
+                      region, sep = ""))
+
+#final_mod <- readRDS(paste("Maxent/ENMeval/maxent_bestmod_1hr_", region, sep = "_"))
+#final_results <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_results_", region, ".csv", sep = ""))
+#final_predictdf <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions_", region, ".csv", sep = ""))
+#final_lambda <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""))
+#final_predictraster <- readRDS(paste("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog_", region, sep = ""))
+```
+
+<!-- ###################### REGIONAL FINAL MODEL ########################### -->
+***
+
+### Running Maxent using the RM and FC values determined above
+#### Stepwise removal of variables; AICc DID NOT IMPROVE WITH THE REMOVAL OF ENV VARIABLE WITH THE LOWEST PERMUTATION IMPORTANCE; abort
+#### Final model created in dismo 
+```{r}
+############# THIS CHANGES FOR EACH REGION  ####################################
+regfc
+pathn <- paste("Maxent/Dismo/", firstup(region), "model", "/", sep = "") 
+
+args_m <- c("betamultiplier=7", "linear=true", "quadratic=true", 
+            "product=true", "threshold=true", "hinge=true", "plots=true",
+            "writeplotdata=true") # otago
+
+args_m <- c("betamultiplier=5", "linear=true", "quadratic=true", 
+            "product=false", "threshold=false", "hinge=false", "plots=true",
+            "writeplotdata=TRUE") # nth otago
+
+args_m <- c("betamultiplier=1", "linear=true", "quadratic=true", 
+            "product=false", "threshold=false", "hinge=false", "plots=true", 
+            "writeplotdata=true") # catlins
+
+args_m <- c("betamultiplier=4", "linear=true", "quadratic=true", 
+            "product=false", "threshold=false", "hinge=false", "plots=true", 
+            "writeplotdata=TRUE") # banks
+
+args_m <- c("betamultiplier=12.5", "linear=true", "quadratic=true", 
+            "product=false", "threshold=false", "hinge=true", "plots=true", 
+            "writeplotdata=TRUE") # stewart
+################################################################################
+
+# Best/final model
+best_mod <- maxent(x = final_layers_r, 
+                   p = pt1_r[2:3], 
+                   a = bg_r, 
+                   args = args_m,
+                   path = substr(pathn, 1, nchar(pathn)-1))
+
+best_results <- best_mod@results # already saved as maxentResults.csv
+best_eval <- dismo::evaluate(p = pt1_r[2:3], a = bg_r, x = final_layers_r, model = best_mod)
+#best_response <- response(best_mod)
+best_predict <- dismo::predict(x = final_layers_r, object = best_mod, type = "cloglog")
+best_predictdf <- as.data.frame(best_predict, xy = TRUE)
+tr <- threshold(best_eval, 'spec_sens')
+best_varimport <- var.importance(best_mod) # df of % contribution, perm import.
+maxent_varimport <- var.importance(best_mod) # for easy plotting later
+
+# Heatmap 
+ggplot() +
+  #coord_quickmap() +
+  geom_raster(data = as.data.frame(best_predict, xy=T), aes(x = x, y = y, fill = layer)) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish)
+
+# Parsing lambdas to get min/max etc.
+lambda <- parse_lambdas(best_mod)
+feature <- c("linearPredictorNormalizer", "densityNormalizer", "numBackgroundPoints", "entropy")
+xx <- c(lambda$linearPredictorNormalizer, lambda$densityNormalizer, lambda$numBackgroundPoints, lambda$entropy)
+xx <- data.frame("feature" = feature, "var" = feature, "lambda" = xx, "min" = 0, "max" = 0, "type" = "none")
+lambda <- data.frame(lambda$lambdas)
+lambda <- rbind(lambda, xx)
+
+# Saving results for the best/final model
+saveRDS(best_mod, paste(pathn, "maxent_bestmod_1hr_", region, sep = ""))
+write.csv(best_results, paste(pathn, "maxent_bestmod_1hr_results_", 
+                              region, ".csv", sep = ""), 
+          row.names = FALSE) # final, best model
+write.csv(best_predictdf, paste(pathn, "maxent_bestmod_1hr_dfpredictions_", 
+                                region, ".csv", sep = ""),
+          row.names = FALSE) # df of predictions, cloglog
+write.csv(lambda, paste(pathn, "maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""),
+          row.names = FALSE)
+saveRDS(best_predict, paste(pathn, "maxent_bestmod_1hr_rastercloglog_", region, sep = ""))
+#best_mod <- readRDS(paste(pathn, "maxent_bestmod_1hr_", region, sep = ""))
+#best_results <- read.csv(paste(pathn, "maxent_bestmod_1hr_results_", region, ".csv", sep = ""))
+#best_predictdf <- read.csv(paste(pathn, "maxent_bestmod_1hr_dfpredictions_", region, ".csv", sep = ""))
+#lambda <- read.csv(paste(pathn, "maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""))
+#best_predict <- readRDS(paste(pathn, "maxent_bestmod_1hr_rastercloglog_", region, sep = ""))
+```
+
+### Regional model, using distnest for fitting and distnestall for predictions
+```{r}
+#best_mod <- readRDS(paste(pathn, "maxent_bestmod_1hr_", region, sep = ""))
+best_predict_col <- dismo::predict(x = final_layers_r_pred, object = best_mod, type = "cloglog")
+best_predictdf_col <- as.data.frame(best_predict_col, xy = TRUE)
+
+# Saving results for the best/final model
+write.csv(best_predictdf_col, paste(pathn,
+                                    "maxent_bestmod_1hr_dfpredictions_allcol_", 
+                                    region, ".csv", sep = ""),
+          row.names = FALSE) # df of predictions, cloglog
+#best_predictdf_col <- read.csv(paste(pathn, "maxent_bestmod_1hr_dfpredictions_allcol_", region, ".csv", sep = ""))
+saveRDS(best_predict_col, paste(pathn,
+                                "maxent_bestmod_1hr_rastercloglog_allcol_", 
+                                region, sep = ""))
+#best_predict_col <- readRDS(paste(pathn, "maxent_bestmod_1hr_rastercloglog_allcol_", region, ".rds", sep = "")))
+
+writeRaster(best_predict_col, paste(pathn,
+                                    "maxent_bestmod_1hr_rastercloglog_allcol_", 
+                                    region, ".tif", sep = ""))
+
+# Heatmap 
+ggplot() +
+  coord_cartesian(xlim = c(xmin(best_predict_col), xmax(best_predict_col)), ylim= c(ymin(best_predict_col), ymax(best_predict_col)), expand = FALSE) + 
+  geom_raster(data = as.data.frame(best_predict_col, xy=T), aes(x = x, y = y, fill = layer)) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish)
+
+```
+
+#### Regional model, no distnest 
+##### Same RM and FC as regional model without distnest
+```{r}
+best_nodist_mod <- maxent(x = final_layers_r_nodist, 
+                          p = pt1_r[2:3], 
+                          a = bg_r, 
+                          args = args_m,
+                          path = paste(pathn, "Nodist", sep = ""))
+
+best_nodist_results <- best_nodist_mod@results # already saved
+best_nodist_eval <- dismo::evaluate(p = pt1_r[2:3], 
+                                    a = bg_r, 
+                                    x = final_layers_r_nodist, 
+                                    model = best_nodist_mod)
+#best_nodist_response <- response(best_nodist_mod)
+best_nodist_predict <- dismo::predict(x = final_layers_r_nodist, object = best_nodist_mod, type = "cloglog")
+best_nodist_predictdf <- as.data.frame(best_nodist_predict, xy = TRUE)
+tr <- threshold(best_nodist_eval, 'spec_sens')
+best_nodist_varimport <- var.importance(best_nodist_mod) # df of % contribution, perm import.
+maxent_varimport_nodist <- best_nodist_varimport # for easy plotting later
+
+# Parsing lambdas to get min/max etc.
+lambda <- parse_lambdas(best_nodist_mod)
+feature <- c("linearPredictorNormalizer", "densityNormalizer", "numBackgroundPoints", "entropy")
+xx <- c(lambda$linearPredictorNormalizer, lambda$densityNormalizer, lambda$numBackgroundPoints, lambda$entropy)
+xx <- data.frame("feature" = feature, "var" = feature, "lambda" = xx, "min" = 0, "max" = 0, "type" = "none")
+lambda <- data.frame(lambda$lambdas)
+lambda <- rbind(lambda, xx)
+
+# Saving results for the best/final model
+saveRDS(best_nodist_mod, paste(pathn, "maxent_bestmod_nodist_1hr_", region, sep = ""))
+write.csv(best_nodist_results, paste(pathn, "maxent_bestmod_nodist_1hr_results_", 
+                                     region, ".csv", sep = ""), row.names = FALSE) # final, best model
+write.csv(best_nodist_predictdf, paste(pathn, "maxent_bestmod_nodist_1hr_dfpredictions_", 
+                                       region, ".csv", sep = ""), row.names = FALSE) # df of predictions, cloglog
+write.csv(lambda, paste(pathn, "maxent_bestmod_nodist_1hr_lambdas_", region, ".csv", sep = ""),
+          row.names = FALSE)
+saveRDS(best_nodist_predict, paste(pathn, "maxent_bestmod_nodist_1hr_rastercloglog_", region, sep = ""))
+writeRaster(best_nodist_predict, paste(pathn,
+                                       "maxent_bestmod_nodist_1hr_rastercloglog_allcol_", 
+                                       region, ".tif", sep = ""))
+
+#best_nodist_mod <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_", region, sep = ""))
+#best_nodist_results <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_results_", region, ".csv", sep = ""))
+#best_nodist_predictdf <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_dfpredictions_", region, ".csv", sep = ""))
+#lambda <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_lambdas_", region, ".csv", sep = ""))
+#best_nodist_predict <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_rastercloglog_", region, sep = ""))
+```
+
+#### Niche comparision between dist and no dist predictions using Schoener's D
+```{r}
+noa <- nicheOverlap(best_predict_col, best_nodist_predict, "D")
+```
+
+### Table of percent contribution and permutation importance
+```{r}
+varimport_df <- data.frame()
+files_mod <- list.files(parent, pattern = "^maxent_bestmod_1hr" , ignore.case = TRUE, full.names = TRUE, recursive = TRUE)
+files_mod <- data.frame(files_mod) %>% filter(!grepl(".csv", files_mod)) %>%
+  filter(!grepl("ENMeval", files_mod)) %>%
+  filter(!grepl("rastercloglog", files_mod))
+for(i in 1:nrow(files_mod)) {
+  xx <- readRDS(files_mod[i,])  
+  nam <- unlist(strsplit(files_mod[i,], "/"))
+  nam <- gsub("model", "",nam[10])
+  varimport <- var.importance(xx) # df of % contribution, perm import.
+  varimport <- pivot_longer(varimport, c(percent.contribution, permutation.importance), names_to = "Model_Parameter", values_to = "Percentage")
+  varimport$model <- nam
+  varimport_df <- rbind(varimport_df, varimport)
+}
+
+
+varimport_nodist_df <- data.frame()
+files_mod <- list.files(parent, pattern = "^maxent_bestmod_nodist_1hr" , ignore.case = TRUE, full.names = TRUE, recursive = TRUE)
+files_mod <- data.frame(files_mod) %>% filter(!grepl(".csv", files_mod)) %>%
+  filter(!grepl("ENMeval", files_mod)) %>%
+  filter(!grepl("rastercloglog", files_mod))
+for(i in 1:nrow(files_mod)) {
+  xx <- readRDS(files_mod[i,])  
+  nam <- unlist(strsplit(files_mod[i,], "/"))
+  nam <- gsub("model", "",nam[10])
+  varimport <- var.importance(xx) # df of % contribution, perm import.
+  varimport <- pivot_longer(varimport, c(percent.contribution, permutation.importance), names_to = "Model_Parameter", values_to = "Percentage_NB")
+  varimport$model <- nam
+  varimport_nodist_df <- rbind(varimport_nodist_df, varimport)
+}
+
+varimport_df2 <- varimport_df %>% 
+  left_join(varimport_nodist_df) %>%
+  arrange(Model_Parameter) %>%
+  pivot_wider(names_from = model, values_from = c("Percentage", "Percentage_NB")) %>%
+  dplyr::select("variable", "Model_Parameter", 
+                "Percentage_Banks", "Percentage_NB_Banks", 
+                "Percentage_Nthotago", "Percentage_NB_Nthotago", 
+                "Percentage_Otago", "Percentage_NB_Otago", 
+                "Percentage_Catlins", "Percentage_NB_Catlins", 
+                "Percentage_Stewart", "Percentage_NB_Stewart", 
+                "Percentage_SI", "Percentage_NB_SI")
+varimport_df2$Model_Parameter[varimport_df2$Model_Parameter == "percent.contribution"] <- "Percent Contribution"
+varimport_df2$Model_Parameter[varimport_df2$Model_Parameter == "permutation.importance"] <- "Permutation Importance"
+
+write.csv(varimport_df2, paste(parent, "/Maxent/Dismo/maxent_allvariableimportance.csv", sep = ""), row.names = FALSE)
+#varimport_df <- read.csv(paste(parent, "/Maxent/Dismo/maxent_allvariableimportance.csv", sep = ""))
+
+clipr::write_clip(varimport_df2)
+```
+
+#### PCA analysis for regional comparisions of environmental space
+```{r}
+#### Preparing data
+a <- banks_all
+a$region <-"Banks Peninsula"
+b <- nthotago_all
+b$region <-"North Otago"
+c <- otago_all
+c$region <-"Otago"
+d <- catlins_all
+d$region <-"Catlins"
+e <- stewart_all
+e$region <-"Stewart Island"
+tt <- rbind(a, b, c, d, e)
+
+tt <- tt %>%
+  dplyr::filter(distcolony != 0) %>%
+  dplyr::filter(bathymetry < 0 & bathymetry > -150) %>%
+  dplyr::filter(mud > 0) %>%
+  na.omit()
+summary(tt)
+write.csv(tt, "Maxent/PCApoints_byregion.csv", row.names = FALSE)
+#tt <- read.csv("Maxent/PCApoints_byregion.csv")
+
+ggplot(data = tt, aes(x = bathymetry, y = distcolony, color = region)) +
+  geom_point(alpha = 0.8, shape = 16) +
+  scale_color_discrete() +
+  stat_ellipse(type = "norm")
+
+scatter3D(x=tt$distcolony, z=tt$bathymetry, y=tt$sf_do, 
+          xlab = "Distance to nest", ylab = "Seafloor Salinity", zlab = "Bathymetry", 
+          phi = 10, bty = "g")
+
+scpt <- scatterplot3d(y=tt$distcolony, z=tt$bathymetry, x=tt$sst_mean, color = as.integer(tt$region), ylab = "Distance to nest", xlab = "Mean SST", zlab = "Bathymetry", pch = 16)
+legend("bottom", legend = levels(tt$region),
+       pch = 16, horiz = TRUE)
+
+### PCA using stats package
+#https://www.r-bloggers.com/2013/11/computing-and-visualizing-pca-in-r/
+pcastat <- prcomp(~., data = tt[3:12], scale = TRUE)
+ggbiplot::ggbiplot(pcastat, groups = tt$region, alpha = 0.2, pch = 16, ellipse = TRUE, var.axes = FALSE) +  ylim(c(-3, 4))
+biplot(pcastat)
+summary(pcastat)
+
+### PCA using FactoMineR package
+#http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/112-pca-principal-component-analysis-essentials/
+library("FactoMineR")
+library("factoextra")
+
+pca2 <- PCA(tt[3:12], ncp = 10)
+eig.val <- data.frame(get_eigenvalue(pca2))
+ig <- fviz_eig(pca2, addlabels = TRUE, ylim = c(0, 50))
+var <- get_pca_var(pca2)
+df_var <- var$coord
+df_var <- data.frame(rbind(df_var, t(eig.val$eigenvalue), t(eig.val$variance.percent)))
+names(df_var) <- c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10")               
+clipr::write_clip(df_var)
+
+fviz_pca_var(pca2, col.var = "black")
+
+# most important (or, contributing) variables can be highlighted
+fviz_pca_var(pca2, col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE) # Avoid text overlapping
+corrplot(var$contrib, is.corr=FALSE)   
+
+# Contributions of variables to PC1
+fviz_contrib(pca2, choice = "var", axes = 1, top = 10)
+# Contributions of variables to PC2
+fviz_contrib(pca2, choice = "var", axes = 2, top = 10)
+fviz_contrib(pca2, choice = "var", axes = 1:2, top = 10)
+
+# Plot by region
+colscale <- c("#0496FF", "#FFBC42","#8F2d56", "#30C1AB",  "#D81159")
+variance.percent_1 <- round(eig.val[,2], digits = 2)
+ind.p <- fviz_pca_biplot(pca2, geom = "point",  pointshape = 21, pointsize = 1, col.ind = NA, fill.ind = tt$region, addEllipses = TRUE, col.var = "black", alpha.ind = 0.5, repel = TRUE) #ellipse = concentration
+ggpubr::ggpar(ind.p,
+              title = "Principal Component Analysis",
+              #subtitle = "South Island",
+              #caption = "Source: factoextra",
+              #xlab = "PC1", ylab = "PC2",
+              xlab = paste0("PC1"," (",variance.percent_1[1],"%)"), 
+              ylab = paste0("PC1"," (",variance.percent_1[2],"%)"), 
+              legend.title = "Region", legend.position = "top",
+              ggtheme = theme_minimal(), 
+              palette = colscale, 
+              repel = TRUE)
+
+saveRDS(pca2, "Maxent/PCA_results")
+#pca2 <- readRDS("Maxent/PCA_results")
+```
+

@@ -1,0 +1,1670 @@
+---
+title: "MAXENT marine modelling Figures: Hickcox et al. (2022)"
+author: "Rachel Hickcox"
+date: "2021-2022"
+output:
+  word_document:
+    reference_docx: "C:/Users/rphic/AppData/Roaming/Microsoft/Templates/phdthesischapter.dotm"
+email: rphickcox@gmail.com
+editor_options:
+  chunk_output_type: console
+---
+
+
+<!-- ################### NOTES ###################################
+1. See script maxent_modelling for modelling and data origin
+4. This is a multifunction notebook. 
+*Run code normally in RStudio = all chunks
+*Knit to word document = just chunks labelled with an f_ or t_
+-->
+```{r setup, echo=FALSE, eval=TRUE}
+knitr::opts_chunk$set(echo=FALSE, include=FALSE, eval = FALSE, fig.align="center", cache=TRUE)
+```
+
+<!--### Load packages-->
+```{r pkg, message=FALSE, warning=FALSE, eval=TRUE, cache=FALSE} 
+pkgs <- c("tidyr", "plyr", "stringr", "dplyr", "ggplot2", "ggpubr", "cowplot", "lubridate",
+          "rgdal", "rgeos", "raster", "data.table", "reshape2", "ggspatial",
+          "knitr", "kableExtra", "broom", "readxl", "formattable", "magick", "officer", 
+          "pals", "gdtools", "flextable", "beepr", "scales", "shades", "ggnewscale", "ENMeval", "gtable", "ragg") 
+invisible(lapply(pkgs, library, character.only = TRUE))
+rm(pkgs)
+options(scipen = 999)
+```
+
+<!--### Loading map files-->
+```{r loadmap, warning=FALSE, message=FALSE, cache=FALSE}
+nztm <- CRS(SRS_string = wkt)
+nzgd2000 <- CRS("+init=epsg:4167")
+wgs <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+local.tz <- "Pacific/Auckland"
+ext <- extent(1092142, 1790142, 4674234, 5447234)
+
+# Creating a spatialpixelsdataframe that is the extent of the data
+bathymetry <- raster("bathymetry_formapping.tif")
+ext_nz <- extent(bathymetry)
+xmin_sp <- ext_nz@xmin
+xmax_sp <- ext_nz@xmax
+ymin_sp <- ext_nz@ymin
+ymax_sp <- ext_nz@ymax
+
+# Creating a rectangle of extent
+poly_box <- Polygon(cbind(c(xmin_sp, xmin_sp, xmax_sp, xmax_sp), c(ymin_sp, ymax_sp, ymax_sp, ymin_sp)))
+poly_box <- Polygons(list(poly_box), ID = "A")
+poly_box <- SpatialPolygons(list(poly_box))
+crs(poly_box) <- nztm
+
+nz_full <- readOGR("NZ_fullcountry_NZTM2000.shp")
+nz <- readOGR("NZ_polygon_NZTM2000_fixed.shp")
+nz <- spTransform(nz, nztm)
+nz_marine <- readOGR("nz_polygon_nztm2000_water75.shp")
+nz_marine <- spTransform(nz_marine, nztm)
+nz_latlong <- spTransform(nz, nzgd2000)
+nz_ec <- readOGR("eastcoastsi_polynztm2000.shp")
+si_ext <- readOGR("NZ_bufferedNZTM2000_75km_offshore.shp")
+nz_rivers <- readOGR("Maxent/kx-nz-major-rivers-SHP/nz-major-rivers.shp")
+nz_rivers <- spTransform(nz_rivers, nztm)
+
+lab4map <- read.csv("cityregionlabels_formaps.csv")
+Encoding(lab4map$Site)<-"UTF-8"
+
+# Sensitive data so not in wd
+birds <- fread("gps_trackedbird_details.csv") %>%
+  mutate(ID = str_extract_all(file_name, "^(.*?)(?=\\_)")) %>%
+  mutate(file_name = tolower(file_name)) %>%
+  mutate(file_name_org = tolower(file_name_org)) 
+
+sites <- fread("yep site coordinates.csv", data.table = FALSE, showProgress = TRUE)
+sort(unique(sites$site_name))
+sites_tracked <- read.csv("tracked_gps_sites.csv")
+sites_tracked$region[sites_tracked$region == "Stewart Island/Rakiura"] <- "Stewart Island"
+sites_tracked$region <- factor(sites_tracked$region, levels = c("Banks Peninsula", "North Otago", "Otago Peninsula", "Catlins", "Stewart Island"))
+sites_sp <- sites_tracked
+coordinates(sites_sp) <- ~x+y
+
+othersites <- shapefile("breedingsites_active20062021.shp")
+crs(othersites) <- nztm
+othersites <- othersites[is.na(othersites$tracked),]
+othersites$tracked <- "Other Colonies"
+
+#### Setting up extents and cropping bathymetry contours and NZ basemap to correct area
+# Creating fishnet, cropping bathymetry
+fishnet <- raster(ext_nz, resolution = 500, crs = nztm)
+fishnet[] <- 1:ncell(fishnet)
+pixgrid <- as(fishnet, "SpatialPixelsDataFrame")
+bathy_crop <- crop(bathymetry, ext_nz)
+bathy_site <- rasterToPoints(bathy_crop)
+bathy_cont <- rasterToContour(bathy_crop, levels = c(-10, seq(-25, -200, by = -25), -400, -800))
+df_bathy <- data.frame(bathy_site)
+names(df_bathy) <- c("Longitude", "Latitude", "Depth")
+nz_site <- crop(nz, ext_nz)
+
+# Creating contour line tidy object with correct contour levels added to the dataframe
+bathy_tidy <- data.frame(tidy(bathy_cont, region = "level", row.names=FALSE))
+conlines <- data.frame("conlevel" = bathy_cont, "id" = row.names(bathy_cont))
+conlines$id <- as.character(conlines$id)
+conlines <- full_join(bathy_tidy, conlines, by = "id")
+consub1 <- conlines %>%
+  group_by(level) %>%
+  filter(row_number() == 10L) %>%
+  filter(level == -10 | level == -25 | level == -50 | level == -75 | level == -100 | level == -200| level == -600 | level == -800)
+consub2 <- conlines %>%
+  group_by(level) %>%
+  filter(row_number() == 590L) %>%
+  filter(level == -25 | level == -50 | level == -75)
+```
+
+<!--### Setup functions and ggplot2 themes-->
+```{r genfun}
+big_border <- fp_border(width = 2)
+std_border <- fp_border(width = 1)
+round1 <- function(x) format(round(x, digits=2), nsmall = 2)
+round01 <- function(x) format(round(x, digits=1), nsmall = 1, trim = TRUE)
+round2 <- function(x) ifelse(abs(mean(x, na.rm =TRUE))<1,format(round(x,2), nsmall = 2, trim = TRUE),
+                             format(round(x, 1), nsmall = 1, trim = TRUE))
+round02 <- function(x) format(round(x, digits=2), nsmall = 2, trim = TRUE)
+
+# Read in a csv
+read.csvnc <- function(temp) {
+  cc <- read.csv(temp)
+  region <-  unlist(strsplit(temp, "/")) 
+  region <- region[10]
+  cc$region <- sub('model', '', region) 
+  cc$X <- NULL
+  return(cc) 
+}
+
+firstup <- function(x) {
+  substr(x, 1, 1) <- toupper(substr(x, 1, 1))
+  x 
+}
+
+std <- function(x) sd(x, na.rm = TRUE)/sqrt(length(x))
+```
+
+<!--### Setup ggplot2 plots-->
+```{r ggfun}
+# Theme for ggplot
+theme.nz <- function(){
+  theme_bw() +
+    theme(panel.grid.major.x = element_blank(),                                       
+          panel.grid.minor.x = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          panel.grid.major.y = element_blank(),  
+          plot.title = element_text(size = 20),
+          axis.title.x = element_text(size = 18), 
+          axis.title.y = element_text(size = 18, angle = 90),
+          axis.text.x = element_text(size = 16),
+          axis.text.y = element_text(size = 16, angle = 90, hjust = 0.5), 
+          legend.position = c(0.80, 0.15), 
+          legend.text = element_text(size = 18), 
+          legend.title = element_blank(),
+          legend.margin = margin(0,0,0,0),
+          legend.key.size = unit(0.75, "lines"),
+          plot.margin = grid::unit(c(0.1, 0.1, 0.1, 0.1), "in"))
+}
+theme_set(theme.nz())
+
+theme.nzsmall <- function(){
+  theme_bw()+
+    theme(panel.grid.major.x = element_blank(),                                       
+          panel.grid.minor.x = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          panel.grid.major.y = element_blank(),  
+          plot.title = element_text(size = 20),
+          axis.title.x = element_text(size = 12), 
+          axis.title.y = element_text(size = 12, angle = 90),
+          axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10, angle = 90, hjust = 0.5), 
+          legend.position = c(0.86, 0.15), 
+          legend.text = element_text(size = 12), 
+          legend.title = element_blank(),
+          legend.margin = margin(0,0,0,0),
+          legend.key.size = unit(0.75, "lines"),
+          plot.margin = grid::unit(c(0.15, 0.3, 0.15, 0.15), "in"))
+}
+#theme_set(theme.nzsmall())
+
+theme.clean <- function(){
+  theme_bw() + 
+    theme(axis.text.x = element_text(size = 10, color = "black"),
+          axis.text.y = element_text(size = 10, color = "black"),
+          axis.title.x = element_text(size = 12, face = "plain", color = "black"),             
+          axis.title.y = element_text(size = 12, face = "plain", color = "black"),             
+          panel.grid.major.x = element_blank(),                                          
+          panel.grid.minor.x = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          panel.grid.major.y = element_blank(),  
+          plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), units = , "cm"),
+          plot.title = element_text(size = 20),
+          legend.text = element_text(size = 12, face = "plain", color = "black"),          
+          legend.position = "bottom")
+}
+theme_set(theme.clean())
+
+nzbase <-  
+  ggplot() + 
+  theme.nz() +
+  coord_cartesian(xlim = c(xmin_sp, xmax_sp), ylim= c(ymin_sp, ymax_sp), expand = FALSE) + 
+  geom_path(data = conlines, aes(x = long, y = lat, z = NULL, group = group), colour="gray") +
+  geom_label(data = consub1, aes(x = long, y = lat, label = level), 
+             fill = "white", label.padding = unit(0.1, "lines"), 
+             label.size = NA, color = "gray", size = 4, position = "jitter") + 
+  geom_label(data = consub2, aes(x = long, y = lat, label = level), 
+             fill = "white", label.padding = unit(0.1, "lines"), 
+             label.size = NA, color = "gray", size = 4)
+
+nzbase_nocl <-  
+  ggplot() + 
+  theme.nz() +
+  labs(x = "Easting", y = "Northing") +
+  annotation_scale(location = "br", height = unit(0.25,"cm"), text_cex = 1)
+```
+
+<!--### Response curve function-->
+```{r otherfun}
+# Response curve function for ALL Maxent model outputs (regional)
+# data is a df with the response x/y that was saved for each region model. Must have 4 columns, i.e. x, y, variable, region
+# envar is the name of the environmental predictor being plotted e.g., "bathymetry" 
+# minmax is a dataframe of the minimum and maximum values for the plot x axis (derived from raster min/max). Must have 4 columns, short (short name matching envar), long (long name to be used as x axis label), max, min
+# col is a list of hex colors equal to the number of regions you are plotting on a single graph
+
+responseCurves2 <- function(data, envar, minmax, col, axis.size = 12){ # df of x,y response, minmax values for x axis, color scale for lines
+  long <- minmax$long[minmax$short == envar]
+  xx <- data %>% 
+    filter(variable == envar)
+  minmaxvalue <- minmax %>% filter(short == envar) %>% dplyr::select(min, max)
+  xxf <- xx %>% filter(x >= minmaxvalue$min, x <= minmaxvalue$max)
+  rplot <- ggplot(xxf, aes(x = x, y = y, group = region, color = region)) +
+    geom_line(size = 0.75) +
+    scale_color_manual(values = col) +
+    xlab(long)+ 
+    ylab("Probability of occurrence") +
+    ylim(c(0,1)) +
+    xlim(c(minmaxvalue$min, minmaxvalue$max)) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 12), 
+          axis.title = element_text(size = axis.size),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          legend.text.align = 0, 
+          legend.position = "none", 
+          axis.title.y = element_blank())
+  return(rplot)
+  #assign(paste(envar, "rp", sep = "_"), rplot, .GlobalEnv)
+}
+```
+
+### SECTION 1: GENERAL FIGURES 
+<!-- ################### FIGURES ###########################################
+
+### Figure 1: Breeding site locations and inset map-->
+```{r sitemap, eval=1:3}
+###### Caption:  
+cap_sitemap <- "Distribution of breeding colonies across the South Island and Stewart Island, New Zealand and the GPS foraging trip data used in this study. Tracks and colonies are coloured by region. White circles denote colonies with at least one confirmed nest since 2003 but with no GPS tracking data. The grey area is the study extent."
+######
+
+theme_set(theme.nz())
+colscale <- c("#0496FF", "#8F2d56", "#30C1AB", "#FFBC42", "#D81159")
+
+# Inset map, entire NZ, region
+inset <- 
+  ggplot() + 
+  coord_cartesian(xlim = c(1000000, 2100000), ylim= c(4600000, 6210000), expand = FALSE) + 
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_polygon(data = poly_box, aes(x = long, y = lat, group = group), fill = NA, color = "red") +
+  annotate("text", label = "New \nZealand", x = 1265000,  y = 5910000, size = 7) +
+  annotation_north_arrow(which_north = "grid", 
+                         location = "br", 
+                         height = unit(0.75, "cm"),
+                         width = unit(0.75, "cm"),
+                         style = north_arrow_orienteering(fill = c("black", "black"))) +
+  theme(axis.title.x = element_blank(), 
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        legend.title = element_blank(),
+        aspect.ratio = 1.25/1)
+
+sitemap <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xmin_sp, xmax_sp), ylim = c(ymin_sp, ymax_sp), expand = FALSE) + 
+  geom_polygon(data = si_ext, aes(x = long, y = lat, group = group), fill = "grey", color = "black") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(data = lab4map[6:8,], aes(x = x, y = y), size = 1.75) + 
+  geom_text(data = lab4map[6:7,], aes(x = x, y = y, label = Site), vjust = -0.5, hjust = 1, size = 5) +
+  geom_text(data = lab4map[8,], aes(x = x, y = y, label = paste0("\u14c", "amaru")), vjust = -0.5, hjust = 1, size = 5) +
+  geom_text(data = lab4map[10,], aes(x = x, y = y, label = Site), vjust = 2, hjust = 0.5, size = 3, angle = 30) +
+  geom_text(data = lab4map[11,], aes(x = x, y = y, label = Site), vjust = 1.5, hjust = 0, size = 3, angle = 17) +
+  geom_point(data = othersites@data, aes(x = x, y = y, fill = tracked, color = tracked), shape = 21, color = "black", fill = "azure2", size = 2) +
+  geom_point(data = sites_tracked, aes(x = x, y = y, fill = region, color = region), shape = 21, color = "black", size = 2.5) +
+  geom_path(data = nz_rivers, aes(x = long, y = lat, group = group), color = "black") +
+  annotate("text", x = 1380000 , y = 4999000, label = "Taieri River", size = 3.5, color = "black", fontface = "italic") +
+  annotate("text", x = 1258000 , y = 5035000, label = "Clutha River", size = 3.5, color = "black", fontface = "italic") +
+  annotate("text", x = 1370000, y = 5060000, label = "Waitaki River", size = 3.5, color = "black", fontface = "italic") +
+  scale_fill_manual(values = colscale) +
+  theme(legend.position = "none")
+sitemap
+
+trackedsitesmap <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xmin_sp, xmax_sp), ylim = c(ymin_sp, ymax_sp), expand = FALSE) + 
+  geom_point(data = sites_tracked, aes(x = x, y = y, fill = region, color = region), shape = 21, color = "black", size = 3) +
+  scale_fill_manual(values = colscale) +
+  theme(legend.position = c(0.83, 0.15))
+# Extract the colour legend - leg1
+leg1 <- gtable_filter(ggplot_gtable(ggplot_build(trackedsitesmap)), "guide-box") 
+
+othersitesmap <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xmin_sp, xmax_sp), ylim = c(ymin_sp, ymax_sp), expand = FALSE) + 
+  geom_point(data = othersites@data, aes(x = x, y = y, fill = tracked, color = tracked), shape = 21, color = "black", size = 2) +
+  scale_fill_manual(values = "azure2") +
+  theme(legend.position = c(0.83, 0.15))
+# Extract the colour legend - leg1
+leg2 <- gtable_filter(ggplot_gtable(ggplot_build(othersitesmap)), "guide-box") 
+
+# Arrange the three components (plot, leg1, leg2)
+# The two legends are positioned outside the plot: 
+# one at the top and the other to the side.
+sitemap_leg <- sitemap + 
+  annotation_custom(grob = leg1, xmin = 1550000, xmax = 1700000, ymin = 4800000, ymax = 4900000)
+sitemap_leg <- sitemap_leg + 
+  annotation_custom(grob = leg2, xmin = 1549000, xmax = 1689000, ymin = 4728000, ymax = 4800000)
+
+gg_inset2 <- ggdraw() +
+  draw_plot(sitemap_leg) +
+  draw_plot(inset, x = 0.09, y = 0.58, width = 0.38, height = 0.38)
+
+ggsave(plot = inset, 
+       filename = "Maxent/Plots_outputs/trackinginset_SI_map.png", 
+       device = "png", width = 3, height = 3)
+
+ggsave(plot = sitemap, 
+       filename = "Maxent/Plots_outputs/trackingsites_SI_map.png", 
+       device = "png", width = 8, height = 9)
+
+ggsave(plot = gg_inset2, 
+       filename = "Maxent/Plots_outputs/trackingsites_SI_mapinset.png", 
+       device = "png", width = 8, height = 9)
+
+gg_inset3 <- ggdraw() +
+  draw_plot(sitemap_leg) +
+  draw_plot(inset, x = 0.09, y = 0.6, width = 0.38, height = 0.38)
+agg_tiff("Maxent/Plots_outputs/Frontiers_Plots/Fig1.png",
+         res = 300, width = 85, height = 103, units = "mm", scaling = 1/2.15)
+plot(gg_inset3)
+dev.off()
+
+```
+```{r f-sitemap, eval=TRUE, include=TRUE, fig.cap=cap_sitemap}
+knitr::include_graphics("trackingsites_SI_mapinset.png")
+```
+
+<!--
+### Figure 2: All environmental rasters maps -->
+```{r envplot, eval=1:3}
+###### Caption: 
+cap_envplot <- "Environmental predictors (A-J) used in the final Maxent models. Environmental predictors (a-j) used in the final Maxent models. Study extent is a 75 km buffer off the east coast of the South Island, New Zealand. Abbreviations and units correspond to those in Table 2. Colour gradients range from high/maximum (red) to low/minimum (blue)."
+#####
+
+theme_set(theme.nz())
+envrasters <- as.data.frame(final_layers, xy = TRUE)
+names(envrasters) <- firstup(names(envrasters))
+
+baseplot <- ggplot() + 
+  coord_cartesian(xlim = c(xmin_sp, xmax_sp), ylim = c(ymin_sp, ymax_sp), expand = FALSE) +
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                nbin = 20, barheight = unit(1.25, "cm"))) +
+  theme(axis.title.x = element_blank(), 
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        legend.title = element_text(size = 9),
+        legend.position = c(0.80, 0.25), 
+        legend.text = element_text(size = 9), 
+        #legend.position = "none",
+        plot.margin = grid::unit(c(0, 0, 0, 0), "in"), 
+        plot.title = element_text(margin = margin(b = -25)),
+        panel.border = element_blank(),
+        aspect.ratio = 1.25/1)
+
+# Env variables- entire extent
+bathy_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1:3)], aes(x = X, y = Y, fill = Bathymetry)) +
+  scale_fill_gradientn(colours = warmcool(25), na.value = "transparent", limits = c(-2000, 0),
+                       labels = c(">-2000", "-1500", "-1000", "-500", "0"), 
+                       breaks = c(-2000, -1500, -1000, -500, 0), oob = squish) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  labs(fill = "Bathymetry (m)") +
+  geom_path(data = nz_rivers, aes(x = long, y = lat, group = group), color = "black") 
+
+currents_plot <-   
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 4)], aes(x = X, y = Y, fill = Currents)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(0, 1),
+                       labels = c("0", "0.5", ">1"), breaks = c(0, 0.5, 1), oob = squish) +
+  labs(fill = "Tidal Current\nSpeed (m/s)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+dist_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 5)], aes(x = X, y = Y, fill = Distcolony)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent") +
+  labs(fill = "Distance\ncolony (m)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+gravel_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 6)], aes(x = X, y = Y, fill = Gravel)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(0, 100),
+                       labels = c("0", "25", "50", "75", "100")) +
+  labs(fill = "Gravel (%)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") 
+
+mud_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 7)], aes(x = X, y = Y, fill = Mud)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(0, 100),
+                       labels = c("0", "25", "50", "75", "100")) +
+  labs(fill = "Mud (%)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+sand_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 8)], aes(x = X, y = Y, fill = Sand)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(0, 100),
+                       labels = c("0", "25", "50", "75", "100")) +
+  labs(fill = "Sand (%)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+carbon_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 9)], aes(x = X, y = Y, fill = Carbon)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(0, 100),
+                       labels = c("0", "25", "50", "75", "100")) +
+  labs(fill = "Carbon (%)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") 
+
+do_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 10)], aes(x = X, y = Y, fill = Sf_do)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent") +
+  labs(fill = "Dissolved\nOxygen (ml/l)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+sst_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 11)], aes(x = X, y = Y, fill = Sst_mean)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(9, 14),
+                       labels = c("<9", "11.5", ">14"), breaks = c(9, 11.5, 14), oob = squish) +
+  labs(fill = "Sea Surface\nTemp (°C)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+turb_plot <- 
+  baseplot + 
+  geom_raster(data = envrasters[c(1, 2, 12)], aes(x = X, y = Y, fill = Turb_mean)) +
+  scale_fill_gradientn(colours = coolwarm(25), na.value = "transparent", limits = c(0, 2),
+                       labels = c("0", "1", ">2"), breaks = c(0, 1, 2), oob = squish) +
+  labs(fill = "Turbidity (ntu)") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black")
+
+envplots2 <- ggarrange(bathy_plot, currents_plot, dist_plot, gravel_plot,
+                       mud_plot, sand_plot, carbon_plot, do_plot, 
+                       sst_plot, turb_plot, 
+                       nrow = 4,
+                       ncol = 3,
+                       #labels = c("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"),
+                       #hjust = -3,
+                       align = "hv")
+ggsave(plot = envplots2,
+       filename = "Maxent/Plots_outputs/Frontiers_Plots/envplots_journal.png",
+       device = "png", width = 9, height = 11, dpi = 600)
+
+# Format for journal plot
+agg_tiff("Maxent/Plots_outputs/Frontiers_Plots/Fig2.png",
+         res = 300, width = 85, height = 150, units = "mm", scaling = 1/1.5)
+plot(envplots2)
+dev.off()
+
+```
+```{r f-envplot, eval=TRUE, include=TRUE, fig.cap=cap_envplot}
+knitr::include_graphics("envplots.png")
+```
+
+
+### SECTION 2: SOUTH ISLAND MODEL MAPS 
+<!--### RELOADING all relevant data (created in maxent_modelling.rmd script)-->
+```{r reload, cache=FALSE}
+parent <- getwd()
+
+# Environmental variables extracted to 1 point/hour- SI extent
+rasbind <- read.csv("Maxent/Filtered/Fishnetcentroid_extractenvvar_SIextent.csv") #centroids
+ext1_all <- read.csv("Maxent/Filtered/All_1hr_extractenvvar.csv") #all env var
+ext1_final <- read.csv("Maxent/Filtered/All_1hr_extractenvvar_final.csv") #final env var
+ext1_pred <- read.csv("Maxent/Filtered/All_1hr_extractenvvar_prediction.csv") #final env var
+
+# Environmental variable rasters
+si_files <- Sys.glob(file.path(parent, "*formapping.tif"))
+si_rasters <- lapply(si_files, raster)
+si_stacked <- stack(si_rasters)
+
+final_layers <- stack(si_stacked$bathymetry_formapping, 
+                      si_stacked$currents_formapping, 
+                      si_stacked$eucdistnest_formapping,
+                      si_stacked$gravel_formapping, 
+                      si_stacked$mud_formapping, 
+                      si_stacked$sand_formapping, 
+                      si_stacked$carbon_formapping, 
+                      si_stacked$botoxygen_formapping, 
+                      si_stacked$sstmean_formapping, 
+                      si_stacked$turbmean_formapping)
+
+final_layers_names <- c("bathymetry", "currents", "distcolony", 
+                        "gravel", "mud", "sand", "carbon", "sf_do", 
+                        "sst_mean", "turb_mean")
+names(final_layers) <- final_layers_names
+
+# with distance to all nest sites instead... for predictions
+final_layers_pred <- stack(si_stacked$bathymetry_formapping, 
+                           si_stacked$currents_formapping, 
+                           si_stacked$eucdistnestall_formapping,
+                           si_stacked$gravel_formapping, 
+                           si_stacked$mud_formapping, 
+                           si_stacked$sand_formapping, 
+                           si_stacked$carbon_formapping, 
+                           si_stacked$botoxygen_formapping, 
+                           si_stacked$sstmean_formapping, 
+                           si_stacked$turbmean_formapping)
+names(final_layers_pred) <- final_layers_names
+
+# ENMeval results
+enm_1hr <- readRDS("Maxent/ENMeval/bestevalmodel_1hr")
+enm_1hr_results <- read.csv("Maxent/ENMeval/enmeval_allmod_1hr_results.csv")
+
+# SI final model- ENMeval
+final_mod <- readRDS("Maxent/ENMeval/maxent_bestmod_1hr.rds")
+aic.opt <- final_mod
+final_results <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_results.csv")
+final_predictdf <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions.csv")
+final_lambda <- read.csv("Maxent/ENMeval/maxent_bestmod_1hr_lambdas.csv")
+final_predictraster <- readRDS("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog.rds")
+maxent_varimport_enmeval <- var.importance(final_mod) # df of % contribution, perm import.
+
+# SI final model - Dismo 
+best_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_SI.rds")
+best_results <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_results_SI.csv")
+pr_thr <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_thresholdMSS.csv")
+best_predictdf <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_SI.csv")
+lambda <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_lambdas_SI.csv")
+best_predict <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_SI.rds")
+maxent_varimport <- var.importance(best_mod) # df of % contribution, perm import.
+
+# SI final model - predicted to all colonies
+best_predictdf_col <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_1hr_dfpredictions_allcol_SI.csv")
+best_predict_col <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_1hr_rastercloglog_allcol_SI.rds")
+
+# SI final model - no distnest 
+best_nodist_mod <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_SI.rds")
+best_nodist_results <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_results_SI.csv")
+pr_thr_nodist <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_thresholdMSS.csv")
+best_nodist_predictdf <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_dfpredictions_SI.csv")
+#lambda <- read.csv("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_lambdas_SI.csv")
+best_nodist_predict <- readRDS("Maxent/Dismo/SImodel/maxent_bestmod_nodist_1hr_rastercloglog_SI.rds")
+maxent_varimport_nodist <- var.importance(best_nodist_mod) # df of % contribution, perm import.
+```
+
+<!-- 
+### Figure 3: Prediction and threshold maps-->
+```{r prth, eval=2:3}
+###### Caption: 
+cap_prth <- "Predicted probability of presence (cloglog) of yellow-eyed penguins in New Zealand across their South Island marine range (A, C). Binary environmental suitability is shown on the right (B, D), with suitable habitat in red. The top two maps (A, B) include distance to the nearest colony as a predictor variable (SI model), while the bottom maps (C, D) do not include distance (SI model (nb))."
+######
+
+# Default
+width <- 8 
+height <- 9 
+xl <- c(1200000, 1400000, 1600000)
+yl <- c(4800000, 5000000, 5200000, 5400000)
+xminl <- xmin(best_predict_col)
+xmaxl <- xmax(best_predict_col)
+yminl <- ymin(best_predict_col)
+ymaxl <- ymax(best_predict_col)
+
+r3 <- as.data.frame(pr_thr, xy=T)
+r3 <- pr_thr
+r3$x <- r3$x+350000
+r4 <- as.data.frame(pr_thr_nodist, xy=T)
+r4$x <- r4$x+350000
+
+# SI model + threshold
+pred_map <- 
+  ggplot() + 
+  theme.nzsmall() +
+  coord_cartesian(xlim = c(xminl, xmaxl+350000), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = c(1200000, 1300000, 1400000)) +
+  scale_y_continuous(breaks = yl) +
+  geom_raster(data = r3, aes(x = x, y = y, fill = layer)) +
+  scale_fill_manual(values = c("grey", "red"), labels = c("Unsuitable", "Suitable", ""), na.value = "transparent") +
+  labs(fill = "Environmental \nSuitability") +
+  geom_path(data = nz_ec, aes(x = long+350000, y = lat, group = group), color = "black", size = 0.3) +
+  new_scale_fill() +
+  geom_raster(data = as.data.frame(best_predict_col, xy=T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(0.5, "cm"), 
+                                barwidth = unit(3, "cm"), 
+                                direction = "horizontal", 
+                                title.position = "top")) +
+  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = " SI Model") +       
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  theme(legend.position = c(0.92, 0.22), 
+        legend.background = element_rect(fill = "transparent"),
+        axis.title.x = element_text(hjust = 0.18),
+        legend.title = element_text(size = 12), 
+        plot.title = element_text(size = 16, margin = margin(5, 0, -25, 10)), 
+        legend.margin = margin(0, 50, 0, 0))
+
+# SI (nb) model + threshold
+pred_map_nd <- 
+  ggplot() + 
+  theme.nzsmall() +
+  coord_cartesian(xlim = c(xminl, xmaxl+350000), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = c(1200000, 1300000, 1400000)) +
+  scale_y_continuous(breaks = yl) +
+  geom_raster(data = r4, aes(x = x, y = y, fill = layer)) +
+  scale_fill_manual(values = c("grey", "red"), labels = c("Unsuitable", "Suitable", ""), na.value = "transparent") +
+  labs(fill = "Environmental \nSuitability") +
+  geom_path(data = nz_ec, aes(x = long+350000, y = lat, group = group), color = "black", size = 0.3) +
+  new_scale_fill() +
+  geom_raster(data = as.data.frame(best_nodist_predict, xy=T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(0.5, "cm"), 
+                                barwidth = unit(3, "cm"), 
+                                direction = "horizontal")) +
+  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = " SI Model (nb)") +       
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  annotation_scale(location = "br", height = unit(0.25,"cm"), text_cex = 1, line_width = 1.2) +
+  theme(legend.position = "none", 
+        axis.title.x = element_text(hjust = 0.18),
+        plot.title = element_text(size = 16, margin = margin(5, 5, -25, 10)))
+
+# Combining all 4 plots
+ggmaxent <- ggarrange(pred_map, pred_map_nd, 
+                      nrow = 2, 
+                      ncol = 1, 
+                      align = "hv")
+ggsave(plot = ggmaxent, filename = "Maxent/Plots_outputs/si_bestmodel_mapthrMSS.png",
+       device = "png", width = 8, height = 12, dpi = 600)
+
+agg_tiff("Maxent/Plots_outputs/Frontiers_Plots/Fig3.png",
+         res = 300, width = 85, height = 125, units = "mm", scaling = 1/2.15)
+plot(ggmaxent)
+dev.off()
+```
+```{r f-prth, eval=TRUE, include=TRUE, fig.cap=cap_prth}
+knitr::include_graphics("si_bestmodel_mapthrMSS.png")
+```
+
+<!--
+### Supplementary Figures: Scatterplot AUC/AICc for all regularization multipliers -->
+```{r rmfc, eval=1:3}
+###### Caption: 
+cap_rmfc <- "Evaluation metrics for 120 candidate Maxent models. Each model is defined by a combination of 5 feature types including linear (L), quadratic (Q), hinge (H), product (P), and threshold (T) and a range of regularization multipliers from 1 to 15. Evaluation metrics include (a) AICc (Akaikes Information Criterion corrected for small sample sizes), (b) average test AUC score (area under the receiving operator characteristic curve), (c) omission rate of testing points at a minimum training threshold (ORMTP), and (d) omission rate of testing points at a 10% training threshold (OR10)." 
+#####
+
+# There is an outlier at LQ_2, removing
+enm_1hr_results <- enm_1hr_results[enm_1hr_results$settings != "LQ_2",]
+
+aiccplot <- 
+  ggplot(data = enm_1hr_results, aes(x = rm, y = AICc, color = features)) +
+  geom_point() +
+  geom_line() +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  xlab("Regularisation Multiplier") +
+  theme(legend.title = element_blank(), 
+        legend.justification = c(1,1), 
+        legend.position = c(1,1), 
+        legend.background = element_rect(linetype = "solid", colour = "black"), 
+        legend.box.margin = margin(0,0,0,0, "cm"), 
+        legend.spacing.y = unit(0, "cm"))
+
+aucplot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.test.AUC, color = features,
+             ymin = avg.test.AUC-var.test.AUC, ymax = avg.test.AUC+var.test.AUC)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  scale_y_continuous(breaks = seq(min(enm_1hr_results$avg.test.AUC, na.rm = TRUE)-0.1, 1, 0.05), limits = c(min(enm_1hr_results$avg.test.AUC, na.rm = TRUE)-0.1, 1), 
+                     labels = number_format(accuracy = 0.01)) +
+  xlab("Regularisation Multiplier") +
+  ylab("Average Test AUC") +
+  theme(legend.position = "none")
+
+aucdiffplot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.diff.AUC,
+             color = features,
+             ymin = avg.diff.AUC-var.diff.AUC, 
+             ymax = avg.diff.AUC+var.diff.AUC)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  xlab("Regularisation Multiplier") +
+  ylab("AUC Difference") +
+  annotate("text", 
+           label = "AUC Difference = Calibration AUC - Evaluation AUC", 
+           x = -Inf, y = Inf, vjust = 1.05, hjust = -0.02) +
+  theme(legend.position = "none")
+
+label1 <- paste("OR[MTP]~'='", "~","minimum~training~presence~threshold~ommission~rate")
+orplot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.test.orMTP, 
+             color = features,
+             ymin = 1,
+             ymax = 1)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  scale_y_continuous(breaks = seq(0, max(enm_1hr_results$avg.test.orMTP, na.rm = TRUE) + 0.0001, 0.0005), limits = c(NA, max(enm_1hr_results$avg.test.orMTP, na.rm = TRUE) + 0.0001)) +
+  xlab("Regularisation Multiplier") +
+  ylab(expression(OR[MTP])) +
+  annotate("text", 
+           label = label1, 
+           parse = TRUE, 
+           x = -Inf, y = Inf, vjust = 1.05, hjust = -0.02) +
+  theme(legend.position = "none")
+
+label1 <- paste("OR[10]~'='", "~","'10%'~presence~threshold~ommission~rate")
+or10plot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.test.or10pct, 
+             color = features,
+             ymin = avg.test.or10pct-var.test.or10pct,
+             ymax = avg.test.or10pct+var.test.or10pct)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  ylim(NA, max(enm_1hr_results$avg.test.or10pct, na.rm = TRUE) + 0.012) +
+  xlab("Regularisation Multiplier") +
+  ylab(expression(OR[10])) +
+  annotate("text", 
+           label = label1, 
+           parse = TRUE,
+           x = -Inf, y = Inf, vjust = 1.05, hjust = -0.02) +
+  theme(legend.position = "none")
+
+rmplots <- ggarrange(aiccplot, aucplot, orplot, or10plot,
+                     nrow = 2, 
+                     ncol = 2, 
+                     labels = c("a", "b", "c", "d"), 
+                     align = "hv", 
+                     hjust = -2)
+
+ggsave(plot = rmplots, 
+       filename = "Maxent/Plots_outputs/Regularization_enmeval_plots.png", 
+       device = "png", width = 11, height = 6)
+```
+```{r f-rmfc, eval=TRUE, include=TRUE, fig.cap=cap_rmfc}
+knitr::include_graphics("Regularization_enmeval_plots.png")
+```
+
+### SECTION 3: REGIONAL MODEL MAPS 
+<!--### RELOADING all relevant data (created in maxent_modelling.rmd script)
+##### THIS MUST BE DONE FOR EACH OF THE 6 MODELS, CHANGING THE REGION AS APPROPRIATE. THEN PLOT -->
+```{r reload2, cache=FALSE}
+# These change depending on the folder
+fs_otago <- c("Otapahi", "Victory Beach", "Aramoana", "Papanui", "Boulder Beach A1",  "Boulder Beach Midsection", "Double Bay")
+fs_nthotago <- c("Bobby's Head", "Bushy Beach")
+fs_catlins <- c("Long Point", "Seal Bay LP", "Seal Bay", 
+                "Nugget Point- Roaring Bay", "Hina Hina Cove", "Penguin Bay", 
+                "Nugget Point", "Helena Falls", 
+                "Te Rere", "Mahaka Point")
+fs_banks <- c("Shell Bay", "Goughs Bay", "Otanerito")
+fs_si <- c("Tommy Island", "Groper Island", "Goat Island", "Mephistopheles", "Rollers Beach", "Golden Beach", "Sealers Bay", "Pigeonhouse Bay", "Stewart Island")
+fs_all <- c("Otapahi", "Victory Beach", "Aramoana", "Papanui", "Boulder Beach A1",  "Boulder Beach Midsection", "Double Bay", "Bobby's Head", "Bushy Beach", "Long Point", "Seal Bay LP", "Seal Bay", "Nugget Point- Roaring Bay", "Hina Hina Cove", "Penguin Bay", "Nugget Point", "Helena Falls", "Te Rere", "Mahaka Point", "Shell Bay", "Goughs Bay", "Otanerito", "Tommy Island", "Goat Island", "Groper Island", "Mephistopheles", "Rollers Beach", "Golden Beach", "Sealers Bay", "Pigeonhouse Bay", "Stewart Island")
+
+# Environmental variables final brick- regional extent
+envfolder <- "C:/Users/rphic/Desktop/Penguins PhD/Mapping/WORKING MAPPING"
+banks_crop <- readRDS("Maxent/Regional_rasters/banks_final")
+nthotago_crop <- readRDS("Maxent/Regional_rasters/nthotago_final")
+otago_crop <- readRDS("Maxent/Regional_rasters/otago_final")
+catlins_crop <- readRDS("Maxent/Regional_rasters/catlins_final")
+stewart_crop <- readRDS("Maxent/Regional_rasters/stewart_final")
+si_ext <- shapefile(file.path(envfolder, "NZ basemaps/NZ_bufferedNZTM2000_75km_offshore.shp"))
+banks_poly <- shapefile(file.path(envfolder, "bankspeninsula_region_marine.shp"))
+nthotago_poly <- shapefile(file.path(envfolder, "nthotago_region_marine.shp"))
+otago_poly <- shapefile(file.path(envfolder, "otago_region_marine.shp"))
+catlins_poly <- shapefile(file.path(envfolder, "catlins_region_marine.shp"))
+stewart_poly <- shapefile(file.path(envfolder, "StewartI_region_marine.shp"))
+
+region <- "otago"
+region <- "nthotago"
+region <- "catlins"
+region <- "banks"
+region <- "stewart"
+
+region2 <- "Otago Peninsula"
+region2 <- "North Otago"
+region2 <- "Catlins"
+region2 <- "Banks Peninsula"
+region2 <- "Stewart Island"
+
+pathn <- paste("Maxent/Dismo/", firstup(region), "model/", sep = "") 
+pathn
+
+# ENMeval results
+enm_1hr <- readRDS(paste("Maxent/ENMeval/bestevalmodel_1hr", region, sep = "_"))
+enm_1hr_results <- read.csv(paste("Maxent/ENMeval/enmeval_allmod_1hr_results_", region, ".csv", sep = ""))
+
+# Final model- ENMeval
+final_mod <- readRDS(paste("Maxent/ENMeval/maxent_bestmod_1hr", region, sep = "_"))
+final_results <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_results_", region, ".csv", sep = ""))
+final_predictdf <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_dfpredictions_", region, ".csv", sep = ""))
+final_lambda <- read.csv(paste("Maxent/ENMeval/maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""))
+final_predictraster <- readRDS(paste("Maxent/ENMeval/maxent_bestmod_1hr_rastercloglog", region, sep = "_"))
+maxent_varimport_enmeval <- var.importance(final_mod) # df of % contribution, perm import.
+
+# Regional Final Model - Dismo 
+best_mod <- readRDS(paste(pathn, "maxent_bestmod_1hr_", region, sep = ""))
+best_results <- read.csv(paste(pathn, "maxent_bestmod_1hr_results_", region, ".csv", sep = ""))
+best_predictdf <- read.csv(paste(pathn, "maxent_bestmod_1hr_dfpredictions_", region, ".csv", sep = ""))
+lambda <- read.csv(paste(pathn, "maxent_bestmod_1hr_lambdas_", region, ".csv", sep = ""))
+best_predict <- readRDS(paste(pathn, "maxent_bestmod_1hr_rastercloglog_", region, sep = ""))
+maxent_varimport <- var.importance(best_mod) # df of % contribution, perm import.
+
+# Regional Final Model - predicted to all colonies
+best_predictdf_col <- read.csv(paste(pathn, "maxent_bestmod_1hr_dfpredictions_allcol_", region, ".csv", sep = ""))
+best_predict_col <- readRDS( paste(pathn, "maxent_bestmod_1hr_rastercloglog_allcol_", region, sep = ""))
+
+# Regional Final Model - no dist
+best_nodist_mod <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_", region, sep = ""))
+best_nodist_results <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_results_", region, ".csv", sep = ""))
+best_nodist_predictdf <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_dfpredictions_", region, ".csv", sep = ""))
+#lambda <- read.csv(paste(pathn, "maxent_bestmod_nodist_1hr_lambdas_", region, ".csv", sep = ""))
+best_nodist_predict <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_rastercloglog_", region, sep = ""))
+maxent_varimport_nodist <- var.importance(best_nodist_mod) # df of % contribution, perm import.
+```
+
+<!--#### Figures 6-10
+#### Combining both with distance and without distance prediction maps-->
+```{r}
+# These change per region!
+# Due to differences in shape of regional maps, the output width and height needs to be modified for each region. They will not be the same size for input into a MS :( 
+
+# Default
+width <- 8 
+height <- 9 
+xl <- c(1200000, 1400000, 1600000)
+yl <- c(4800000, 5000000, 5200000, 5400000)
+xminl <- xmin(best_predict_col)
+xmaxl <- xmax(best_predict_col)
+yminl <- ymin(best_predict_col)
+ymaxl <- ymax(best_predict_col)
+
+#Catlins
+width <- 9
+height <- 9
+xl <- c(1250000, 1350000, 1450000)
+yl <- c(4730000, 4810000, 4890000)
+yminl <- 4720000
+
+#Banks
+width <- 9
+height <- 9
+xl <- c(1530000, 1600000, 1670000)
+yl <- c(5080000, 5160000, 5240000)
+xmaxl <- 1740000
+
+###################################################################
+# Output map
+pred_map <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl) +
+  scale_y_continuous(breaks = yl) +
+  geom_raster(data = as.data.frame(best_predict_col, xy = T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+ geom_point(data = lab4map[6:8,], aes(x = x, y = y), size = 1.75) + 
+ geom_text(data = lab4map[6:8,], aes(x = x, y = y, label = Site), vjust = -0.5, hjust = 1, size = 5) +
+  #geom_point(aes(x = 1354400,  y = 4851464, label = "Nugget Point"), size = 1.75) +
+  #annotate("text", label = "Nugget Point", x = 1335000,  y = 4853000, size = 5, hjust = 0.55) +
+  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model", sep = " ")) +   
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(3, "cm"), 
+                                barwidth = unit(0.9, "cm"))) +
+  theme(legend.title = element_text(size = 18),
+        legend.position = c(0.86, 0.18), 
+        plot.title = element_text(margin = margin(5, 0, -25, 10)), 
+        plot.margin = margin(25, 25, 25, 25))
+
+pred_map_nodist1 <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl)+
+  scale_y_continuous(breaks = yl)+
+  geom_raster(data = as.data.frame(best_nodist_predict, xy=T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(data = lab4map[6:8,], aes(x = x, y = y), size = 1.75) + 
+  geom_text(data = lab4map[6:8,], aes(x = x, y = y, label = Site), vjust = -0.5, hjust = 1, size = 5) +
+  # geom_point(aes(x = 1354400,  y = 4851464, label = "Nugget Point"), size = 1.75) +
+  # annotate("text", label = "Nugget Point", x = 1335000,  y = 4853000, size = 5, hjust = 0.55) +
+labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model (nb)", sep = " ")) +   
+  theme(legend.title = element_text(size = 18),
+        legend.position = "none", 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        plot.title = element_text(margin = margin(5, 0, -25, 10)))
+pred_map_nodist1
+
+bothpredmap <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1, 
+                         labels = c("a", "b"), 
+                         align = "hv", 
+                         hjust = -4, vjust = 3,
+                         font.label = list(size = 16))
+ggsave(plot = bothpredmap, filename = paste("Maxent/Plots_outputs/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+       device = "png", width = width*2, height = height, dpi = 600)
+
+# Format for journal plot
+bothpredmap2 <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1, 
+                         align = "hv")
+
+agg_tiff(paste("Maxent/Plots_outputs/Frontiers_Plots/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+         res = 300, width = 180, height = 110, units = "mm", scaling = 1/2.2)
+plot(bothpredmap2)
+dev.off()
+
+#Catlins/Banks
+agg_tiff(paste("Maxent/Plots_outputs/Frontiers_Plots/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+         res = 300, width = 180, height = 95, units = "mm", scaling = 1/2.3)
+plot(bothpredmap2)
+dev.off()
+```
+
+<!--#### North Otago map-->
+```{r nthotago}
+#Nthotago
+width <- 7
+height <- 9
+xl <- c(1450000, 1500000, 1550000)
+yl <- c(4900000, 5000000, 5100000)
+
+###################################################################
+# Output map
+pred_map <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl) +
+  scale_y_continuous(breaks = yl) +
+  geom_raster(data = as.data.frame(best_predict_col, xy = T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(data = lab4map[8,], aes(x = x, y = y), size = 1.75) + 
+  geom_text(data = lab4map[8,], aes(x = x, y = y, label = paste0("\u14c", "amaru")), vjust = -0.5, hjust = 1, size = 5) +
+  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model", sep = " ")) +   
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(3, "cm"), 
+                                barwidth = unit(0.9, "cm"))) +
+  theme(legend.title = element_text(size = 18),
+        legend.position = c(0.86, 0.18), 
+        plot.title = element_text(margin = margin(5, 0, -25, 10)), 
+        plot.margin = margin(25, 25, 25, 25))
+
+pred_map_nodist1 <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl)+
+  scale_y_continuous(breaks = yl)+
+  geom_raster(data = as.data.frame(best_nodist_predict, xy=T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(data = lab4map[8,], aes(x = x, y = y), size = 1.75) + 
+  geom_text(data = lab4map[8,], aes(x = x, y = y, label = paste0("\u14c", "amaru")), vjust = -0.5, hjust = 1, size = 5) +
+labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model (nb)", sep = " ")) +   
+  theme(legend.title = element_text(size = 18),
+        legend.position = "none", 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        plot.title = element_text(margin = margin(5, 0, -25, 10)))
+pred_map_nodist1
+
+bothpredmap <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1, 
+                         labels = c("a", "b"), 
+                         align = "hv", 
+                         hjust = -4, vjust = 3,
+                         font.label = list(size = 16))
+ggsave(plot = bothpredmap, filename = paste("Maxent/Plots_outputs/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+       device = "png", width = width*2, height = height, dpi = 600)
+
+# Format for journal plot
+bothpredmap2 <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1, 
+                         align = "hv")
+
+agg_tiff(paste("Maxent/Plots_outputs/Frontiers_Plots/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+         res = 300, width = 180, height = 110, units = "mm", scaling = 1/2.2)
+plot(bothpredmap2)
+dev.off()
+```
+
+<!--#### Otago Peninsula-->
+```{r op}
+width <- 8
+height <- 9
+xl <- c(1380000, 1420000, 1460000, 1500000)
+yl <- c(4850000, 4890000, 4930000, 4970000)
+xmaxl <- 1530000
+
+###################################################################
+
+# Output map
+pred_map <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl) +
+  scale_y_continuous(breaks = yl) +
+  geom_raster(data = as.data.frame(best_predict_col, xy = T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(data = lab4map[6:8,], aes(x = x, y = y), size = 1.75) + 
+  geom_text(data = lab4map[6:8,], aes(x = x, y = y, label = Site), vjust = -0.5, hjust = 1, size = 5) +
+  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model", sep = " ")) +   
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(3, "cm"), 
+                                barwidth = unit(0.9, "cm"))) +
+  theme(legend.title = element_text(size = 18),
+        legend.position = c(0.86, 0.18), 
+        plot.title = element_text(margin = margin(5, 0, -25, 10), size = 16), 
+        plot.margin = margin(25, 25, 25, 25))
+
+pred_map_nodist1 <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl)+
+  scale_y_continuous(breaks = yl)+
+  geom_raster(data = as.data.frame(best_nodist_predict, xy=T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  #geom_point(data = sites, aes(x = x, y = y), shape = 21, color = "black", size = 2.5) +
+  geom_point(data = lab4map[6:8,], aes(x = x, y = y), size = 1.75) + 
+  geom_text(data = lab4map[6:8,], aes(x = x, y = y, label = Site), vjust = -0.5, hjust = 1, size = 5) +
+  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model (nb)", sep = " ")) +   
+  theme(legend.title = element_text(size = 18),
+        legend.position = "none", 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        plot.title = element_text(margin = margin(5, 0, -25, 10), size = 16))
+pred_map_nodist1
+
+bothpredmap <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1, 
+                         labels = c("a", "b"), 
+                         align = "hv", 
+                         hjust = -4, vjust = 3,
+                         font.label = list(size = 16))
+ggsave(plot = bothpredmap, filename = paste("Maxent/Plots_outputs/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+       device = "png", width = width*2, height = height, dpi = 600)
+
+# Format for journal plot
+bothpredmap2 <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1,
+                         align = "hv")
+
+agg_tiff(paste("Maxent/Plots_outputs/Frontiers_Plots/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+         res = 300, width = 180, height = 110, units = "mm", scaling = 1/2.2)
+plot(bothpredmap2)
+dev.off()
+```
+
+<!--#### Stewart Island-->
+```{r stis}
+width <- 9
+height <- 9
+xl <- c(1150000, 1220000, 1290000)
+yl <- c(4750000, 4800000, 4850000, 4900000)
+yminl <- 4720000
+ymaxl <- 4920000
+xmaxl <- 1310000
+xminl <- xmin(best_predict_col)
+
+###################################################################
+
+pred_map <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl) +
+  scale_y_continuous(breaks = yl) +
+  geom_raster(data = as.data.frame(best_predict_col, xy = T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(aes(x = 1243559, y = 4849232), size = 1.75) + 
+  geom_text(aes(x = 1261200, y = 4849000, label = "Invercargill"), size = 5) +
+  geom_text(aes(x = 1216500, y = 4752000, label = "Port Pegasus"), size = 5, color = "white") +
+  geom_text(aes(x = 1255000, y = 4790446, label = "Paterson Inlet"), size = 5, color = "white") +
+  geom_text(aes(x = 1256520, y = 4820035, label = "Foveaux Strait"), size = 5, color = "black") +
+  geom_text(aes(x = 1165000, y = 4807000, label = "Codfish Island"), size = 5, color = "white") +
+  annotate("rect", xmin = xminl, xmax = xmaxl, ymin = 4900000, ymax = ymaxl, fill = "white") +  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model", sep = " ")) +   
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(3, "cm"), 
+                                barwidth = unit(0.9, "cm"))) +
+  annotation_scale(location = "br", height = unit(0.25,"cm"), text_cex = 1, width_hint = 0.15, text_col = "white") +
+  theme(legend.title = element_text(size = 18),
+        legend.position = c(0.86, 0.875), 
+        #legend.position = c(0.86, 0.865), 
+ plot.title = element_text(margin = margin(5, 0, -25, 10)), 
+        plot.margin = margin(25, 25, 25, 25))
+
+# Output map
+pred_map_nodist1 <- 
+  nzbase_nocl + 
+  coord_cartesian(xlim = c(xminl, xmaxl), ylim = c(yminl, ymaxl), expand = FALSE) + 
+  scale_x_continuous(breaks = xl)+
+  scale_y_continuous(breaks = yl)+
+  geom_raster(data = as.data.frame(best_nodist_predict, xy = T), aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours = saturation(jet(100), scalefac(0.6)), na.value = "transparent",
+                       limits = c(0, 1), labels = c("0", "0.5", "1"), 
+                       breaks = c(0, 0.5, 1), oob = squish) +
+  # geom_point(data = pt1_r[2:3], aes(x = x, y = y), col = 'red', cex = 0.05) +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_polygon(data = nz_full, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(aes(x = 1243559, y = 4849232), size = 1.75) + 
+  geom_text(aes(x = 1261200, y = 4849000, label = "Invercargill"), size = 5) +
+  geom_text(aes(x = 1216500, y = 4752000, label = "Port Pegasus"), size = 5, color = "white") +
+  geom_text(aes(x = 1258000, y = 4790000, label = "Paterson Inlet"), size = 5, color = "white") +
+  geom_text(aes(x = 1256520, y = 4820035, label = "Foveaux Strait"), size = 5, color = "black") +
+  geom_text(aes(x = 1165000, y = 4807000, label = "Codfish Island"), size = 5, color = "white") +
+  annotate("rect", xmin = xminl, xmax = xmaxl, ymin = 4900000, ymax = ymaxl, fill = "white") +  labs(x = "Easting", y = "Northing", fill = "Probability of \nPresence", title = paste("", region2, "Model (nb)", sep = " ")) +   
+  guides(fill = guide_colourbar(ticks = TRUE, ticks.colour = "black",
+                                draw.ulim = FALSE, draw.llim = FALSE, 
+                                barheight = unit(3, "cm"), 
+                                barwidth = unit(0.9, "cm"))) +
+  annotation_scale(location = "br", height = unit(0.25,"cm"), text_cex = 1, width_hint = 0.15, text_col = "white") +
+  theme(legend.title = element_text(size = 18),
+        legend.position = "none", 
+        plot.title = element_text(margin = margin(5, 0, -25, 10)), 
+        plot.margin = margin(25, 25, 25, 25))
+
+bothpredmap <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1, 
+                         labels = c("a", "b"), 
+                         align = "hv", 
+                         hjust = -4, vjust = 3,
+                         font.label = list(size = 16))
+ggsave(plot = bothpredmap, filename = paste("Maxent/Plots_outputs/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+       device = "png", width = width*2, height = height, dpi = 600)
+
+# Format for journal plot
+bothpredmap2 <- ggarrange(pred_map, pred_map_nodist1,
+                         ncol = 2,
+                         nrow = 1,
+                         align = "hv")
+
+agg_tiff(paste("Maxent/Plots_outputs/Frontiers_Plots/", region,
+                                            "_both_mapcloglog.png", sep = ""), 
+         res = 300, width = 180, height = 95, units = "mm", scaling = 1/2.3)
+plot(bothpredmap2)
+dev.off()
+```
+
+```{r f-predmap-comboR, eval=TRUE, include=TRUE}
+knitr::include_graphics(c("banks_both_mapcloglog.png", "nthotago_both_mapcloglog.png", "otago_both_mapcloglog.png","catlins_both_mapcloglog.png", "stewart_both_mapcloglog.png"))
+```
+
+<!--
+### Supplementary Figures: Scatterplot AUC/AICc for all regularization multipliers -->
+```{r rmfc}
+theme_set(theme.clean())
+aiccplot <- 
+  ggplot(data = enm_1hr_results, aes(x = rm, y = AICc, color = features)) +
+  geom_point() +
+  geom_line() +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  xlab("Regularisation Multiplier") +
+  theme(legend.title = element_blank(), 
+        legend.justification = c(1,1), 
+        legend.position = c(1,1), 
+        legend.background = element_rect(linetype = "solid", colour = "black"), 
+        legend.box.margin = margin(0,0,0,0, "cm"), 
+        legend.spacing.y = unit(0, "cm"))
+
+aucplot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.test.AUC, color = features,
+             ymin = avg.test.AUC-var.test.AUC, ymax = avg.test.AUC+var.test.AUC)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  scale_y_continuous(breaks = seq(min(enm_1hr_results$avg.test.AUC, na.rm = TRUE)-0.1, 1, 0.05), limits = c(min(enm_1hr_results$avg.test.AUC, na.rm = TRUE)-0.1, 1), 
+                     labels = number_format(accuracy = 0.01)) +
+  xlab("Regularisation Multiplier") +
+  ylab("Average Test AUC") +
+  theme(legend.position = "none")
+
+aucdiffplot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.diff.AUC,
+             color = features,
+             ymin = avg.diff.AUC-var.diff.AUC, 
+             ymax = avg.diff.AUC+var.diff.AUC)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  xlab("Regularisation Multiplier") +
+  ylab("AUC Difference") +
+  annotate("text", 
+           label = "AUC Difference = Calibration AUC - Evaluation AUC", 
+           x = -Inf, y = Inf, vjust = 1.05, hjust = -0.02) +
+  theme(legend.position = "none")
+
+label1 <- paste("OR[MTP]~'='", "~","minimum~training~presence~threshold~ommission~rate")
+orplot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.test.orMTP, 
+             color = features,
+             ymin = 1,
+             ymax = 1)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  scale_y_continuous(breaks = seq(0, max(enm_1hr_results$avg.test.orMTP, na.rm = TRUE) + 0.0001, 0.0005), limits = c(NA, max(enm_1hr_results$avg.test.orMTP, na.rm = TRUE) + 0.0001)) +
+  xlab("Regularisation Multiplier") +
+  ylab(expression(OR[MTP])) +
+  annotate("text", 
+           label = label1, 
+           parse = TRUE, 
+           x = -Inf, y = Inf, vjust = 1.05, hjust = -0.02) +
+  theme(legend.position = "none")
+
+label1 <- paste("OR[10]~'='", "~","'10%'~presence~threshold~ommission~rate")
+or10plot <- 
+  ggplot(data = enm_1hr_results, 
+         aes(x = rm, y = avg.test.or10pct, 
+             color = features,
+             ymin = avg.test.or10pct-var.test.or10pct,
+             ymax = avg.test.or10pct+var.test.or10pct)) +
+  geom_point() +
+  geom_line() +
+  geom_linerange(show.legend = FALSE) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(1, 15, 1)) +
+  ylim(NA, max(enm_1hr_results$avg.test.or10pct, na.rm = TRUE) + 0.012) +
+  xlab("Regularisation Multiplier") +
+  ylab(expression(OR[10])) +
+  annotate("text", 
+           label = label1, 
+           parse = TRUE,
+           x = -Inf, y = Inf, vjust = 1.05, hjust = -0.02) +
+  theme(legend.position = "none")
+
+rmplots <- ggarrange(aiccplot, aucplot, orplot, or10plot,
+                     nrow = 2, 
+                     ncol = 2, 
+                     labels = c("a", "b", "c", "d"), 
+                     align = "hv", 
+                     hjust = -2)
+
+ggsave(plot = rmplots, 
+       filename = paste("Maxent/Plots_outputs/Regularization_enmeval_plots_", region, ".png", sep = ""), 
+       device = "png", width = 11, height = 6)
+```
+```{r f-rmfc-combo, eval=TRUE, include=TRUE, fig.cap=""}
+knitr::include_graphics(c("Regularization_enmeval_plots_banks.png", "Regularization_enmeval_plots_nthotago.png", "Regularization_enmeval_plots_otago.png", "Regularization_enmeval_plots_catlins.png", "Regularization_enmeval_plots_stewart.png"))
+```
+
+### SECTION 4: COMBO PLOTS
+<!--### SOUTH ISLAND Generating response curve values from Dismo, saving to CSV-->
+```{r rescurvdist}
+final_layers2 <- c("bathymetry", 
+                   "currents", "distcolony",
+                   "gravel", "mud", "sand", "carbon", "sf_do", 
+                   "sst_mean", 
+                   "turb_mean")
+
+varxtitle <- data.frame(short = final_layers2, 
+                        long = c("Bathymetry (m)", "Tidal Current Speed (m/s)",
+                                 "Distance to Colony (m)", 
+                                 "Gravel (%)", "Mud (%)", "Sand (%)", 
+                                 " Carbonate (%)", "Dissolved Oxygen (ml/l)", 
+                                 "Sea Surface Temperature (\u00B0C)", 
+                                 "Turbidity (ntu)"))
+
+# Function response_2 is saved in script response_2_plotedit_enmeval.R.
+# Ignore warnings
+source("../response_2_plotedit_enmeval.R")
+
+for(i in 1:10){
+  xx <- best_mod@presence[i]
+  nam <- names(xx)
+  if(nam == "mud" | nam == "carbon" | nam == "gravel" | nam == "sand"){
+    xxmin <- 0
+    xxmax <- 100
+  } else {
+    xxsd <-  lapply(xx, sd, na.rm = T)[[1]]
+    xxmin <- min(xx, na.rm = T) - xxsd
+    xxmax <-  max(xx, na.rm = T) + xxsd
+  }
+  res_plot <- response_2(best_mod, var = i, xlim = c(xxmin, xxmax), varnames = varxtitle)
+  assign(paste("p", i, sep = ""), res_plot)
+}
+
+## rsdf created from function for each variable (df of response curves)
+rsdf <- data.frame()
+for(j in 1:length(final_layers2)){
+  xdf <- get(paste("rsdf", j, sep = ""))
+  rsdf <- rbind(rsdf, xdf)
+}
+write.csv(rsdf, "Maxent/Dismo/SImodel/SI_responsedf.csv")
+```
+
+<!--### REGIONS Generating response curve values from Dismo, saving to CSV
+##### THIS MUST BE DONE FOR EACH OF THE 6 MODELS, CHANGING THE REGION AS APPROPRIATE. THEN PLOT -->
+```{r regresponsedist}
+# Regional Final Model - dist
+region <- "otago"
+region <- "nthotago"
+region <- "catlins"
+region <- "banks"
+region <- "stewart"
+
+region2 <- "Otago Peninsula"
+region2 <- "North Otago"
+region2 <- "Catlins"
+region2 <- "Banks Peninsula"
+region2 <- "Stewart Island"
+
+pathn <- paste("Maxent/Dismo/", firstup(region), "model/", sep = "") 
+pathn
+
+best_mod <- readRDS(paste(pathn, "maxent_bestmod_1hr_", region, sep = ""))
+
+# Response curves
+for(i in 1:length(final_layers2)){
+  xx <- best_mod@presence[i]
+  nam <- names(xx)
+  if(nam == "mud" | nam == "carbon" | nam == "gravel" | nam == "sand"){
+    xxmin <- 0
+    xxmax <- 100
+    xxsd <-  lapply(xx, sd, na.rm = T)[[1]]
+    
+  } else {
+    xxsd <-  lapply(xx, sd, na.rm = T)[[1]]
+    xxmin <- min(xx, na.rm = T) - xxsd
+    xxmax <-  max(xx, na.rm = T) + xxsd
+  }
+  res_plot <- response_2(best_mod, var = i, xlim = c(xxmin, xxmax), varnames = varxtitle, expand = xxsd)
+  assign(paste("p", i, sep = ""), res_plot)
+}
+
+## rsdf created from function for each variable (df of response curves)
+rsdf <- data.frame()
+for(j in 1:length(final_layers2)){
+  xdf <- get(paste("rsdf", j, sep = ""))
+  rsdf <- rbind(rsdf, xdf)
+}
+write.csv(rsdf, paste(pathn, region, "_responsedf.csv", sep = ""))
+```
+
+<!--### Figure 4: Combined response plot for all models for each environmental variable with distcolony -->
+```{r rescurv-combo, eval=2:3}
+###### Caption: 
+cap_rescurv <- "Response curves of each environmental predictor (A-J), including distance to colony, for each regional and South Island (SI) Maxent model predicting yellow-eyed penguin marine distribution."
+#####
+
+pathnn <- paste(parent, "Maxent", "Dismo", sep = "/")
+colscale2 <- c("#0496FF", "#FFBC42", "#8F2d56", "#30C1AB", "#8d96a3", "#D81159")
+
+# Creating dataframe of all responsedf for all regions
+files_all <- list.files(path = pathnn,
+                        pattern = "responsedf.csv", 
+                        full.names = TRUE, recursive = TRUE)
+files_all_nodist <- list.files(path = pathnn,
+                               pattern = "nodist_responsedf.csv", 
+                               full.names = TRUE, recursive = TRUE)
+files_all <- setdiff(files_all, files_all_nodist)
+
+data_response <- lapply(files_all, read.csvnc)
+data_response <- bind_rows(data_response)
+data_response$region[data_response$region == "Nthotago"] <- "North Otago"
+data_response$region[data_response$region == "Banks"] <- "Banks Peninsula"
+data_response$region[data_response$region == "Stewart"] <- "Stewart Island"
+data_response$region[data_response$region == "Otago"] <- "Otago Peninsula"
+data_response$region[data_response$region == "SI"] <- "South Island"
+
+# Determining xlim for all env predictors to clip response curves (prevent extrapolating into impossible values)
+envminmax <- read_excel("Maxent/Plots_outputs/Summarytables_maxent.xlsx", sheet = "Env_minmax", col_names = TRUE, na = "", n_max = 11, trim_ws = TRUE)
+envminmax <- envminmax %>% mutate(long2 = long) %>%
+  mutate(long = c("Bathymetry (m)", "Tidal Current Speed (m/s)",
+                  "Distance to Colony (m)", 
+                  "Gravel (%)", "Mud (%)", "Sand (%)", 
+                  "Carbonate (%)", "Dissolved Oxygen (ml/l)", 
+                  "Sea Surface Temperature (\u00B0C)", 
+                  "Turbidity (ntu)"))
+
+# For each environmental variable, apply function responseCurves, see chunk at beginning of script
+envnam <- vector('list')
+j <- 0
+for(i in unique(envminmax$short)){
+  axis.size <- ifelse(i == "sst_mean" |i == "sf_do" , 10, 12)
+  pp <- responseCurves2(data_response, i, envminmax, colscale2, axis.size)
+  assign(paste(i, "rp", sep = "_"), pp, .GlobalEnv)
+  j <- j+1
+  envnam[[j]] <- pp
+}
+
+# Getting legend for plot
+lg1 <- ggplot(data_response[data_response$variable == "bathymetry",], aes(x = x, y = y, group = region, color = region)) +
+  geom_line(size = 1.25) +
+  scale_color_manual(values = colscale2) +
+  labs(color = "Models") +
+  theme(legend.position = "right")
+lg1 <- gtable_filter(ggplot_gtable(ggplot_build(lg1)), "guide-box") 
+envnam[[11]] <- lg1
+
+joint_resplot <- ggarrange(plotlist = envnam,  
+                           nrow = 3, 
+                           ncol = 4, 
+                           labels = c("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"),
+                           align = "hv", 
+                           label.x = 0.17, 
+                           label.y = 0.98)
+joint_resplot <- annotate_figure(joint_resplot, left = text_grob("Probability of Presence", 
+                                                                 size = 12, rot = 90))
+
+joint_resplot
+ggsave(plot = joint_resplot,
+       filename = paste("Maxent/Plots_outputs/joint_responsecurves.png", sep = ""),
+       device = "png", width = 11, height = 7, dpi = 600)
+
+
+joint_resplot2 <- ggarrange(plotlist = envnam,  
+                            nrow = 3, 
+                            ncol = 4)
+joint_resplot2 <- annotate_figure(joint_resplot2, left = text_grob("Probability of Presence", 
+                                                                   size = 12, rot = 90))
+
+agg_tiff("Maxent/Plots_outputs/Frontiers_Plots/Fig4.png",
+         res = 300, width = 180, height = 100, units = "mm", scaling = 1/1.45)
+plot(joint_resplot2)
+dev.off()
+
+```
+```{r f-rescurv-combo, eval=TRUE, include=TRUE, fig.cap=cap_rescurv}
+knitr::include_graphics("joint_responsecurves.png")
+```
+
+<!--### SOUTH ISLAND NO DISTANCE Generating response curve values from Dismo, saving to CSV-->
+```{r rescurv}
+for(i in 1:9){
+  xx <- best_nodist_mod@presence[i]
+  nam <- names(xx)
+  if(nam == "mud" | nam == "carbon" | nam == "gravel" | nam == "sand"){
+    xxmin <- 0
+    xxmax <- 100
+  } else {
+    xxsd <-  lapply(xx, sd, na.rm = T)[[1]]
+    xxmin <- min(xx, na.rm = T) - xxsd
+    xxmax <-  max(xx, na.rm = T) + xxsd
+  }
+  res_plot <- response_2(best_nodist_mod, var = i, xlim = c(xxmin, xxmax), varnames = varxtitle)
+  assign(paste("p_nodist_", i, sep = ""), res_plot)
+}
+
+## rsdf created from function for each variable (df of response curves)
+rsdf_nodist <- data.frame()
+for(j in 1:length(final_layers2)){
+  xdf <- get(paste("rsdf", j, sep = ""))
+  rsdf_nodist <- rbind(rsdf_nodist, xdf)
+}
+rsdf_nodist$variable <- paste(rsdf_nodist$variable, "nodist", sep = "_")
+write.csv(rsdf_nodist, "Maxent/Dismo/SImodel/SI_nodist_responsedf.csv")
+```
+
+<!--### REGIONS NO DISTANCE Generating response curve values from Dismo, saving to CSV
+##### THIS MUST BE DONE FOR EACH OF THE 6 MODELS, CHANGING THE REGION AS APPROPRIATE. THEN PLOT -->
+```{r regresponse}
+# Regional Final Model - no dist
+region <- "otago"
+region <- "nthotago"
+region <- "catlins"
+region <- "banks"
+region <- "stewart"
+
+region2 <- "Otago Peninsula"
+region2 <- "North Otago"
+region2 <- "Catlins"
+region2 <- "Banks Peninsula"
+region2 <- "Stewart Island"
+
+pathn <- paste("Maxent/Dismo/", firstup(region), "model/", sep = "") 
+pathn
+
+best_nodist_mod <- readRDS(paste(pathn, "maxent_bestmod_nodist_1hr_", region, sep = ""))
+
+# Response curves
+for(i in 1:length(final_layers2)){ #no distance layer, n-1
+  xx <- best_nodist_mod@presence[i]
+  nam <- names(xx)
+  if(nam == "mud" | nam == "carbon" | nam == "gravel" | nam == "sand"){
+    xxmin <- 0
+    xxmax <- 100
+  } else {
+    xxsd <-  lapply(xx, sd, na.rm = T)[[1]]*2
+    xxmin <- min(xx, na.rm = T) - xxsd
+    xxmax <-  max(xx, na.rm = T) + xxsd
+  }
+  res_plot <- response_2(best_nodist_mod, var = i, xlim = c(xxmin, xxmax), varnames = varxtitle)
+  assign(paste("p_nodist_", i, sep = ""), res_plot)
+}
+
+## rsdf created from function for each variable (df of response curves)
+rsdf_nodist <- data.frame()
+for(j in 1:length(final_layers2)){
+  xdf <- get(paste("rsdf", j, sep = ""))
+  rsdf_nodist <- rbind(rsdf_nodist, xdf)
+}
+rsdf_nodist$variable <- paste(rsdf_nodist$variable, "nodist", sep = "_")
+write.csv(rsdf_nodist, paste(pathn, region, "_nodist_responsedf.csv", sep = ""))
+```
+
+<!--### Figure 5: Combined response plot for all models for each environmental variable WITHOUT distcolony-->
+```{r rescurve-combo-nd, eval=2:3}
+###### Caption: 
+cap_rescurv_nd <- "Response curves of each environmental predictor (A-I), excluding distance to colony, for each regional and South Island (SI) Maxent model predicting yellow-eyed penguin marine distribution."
+#####
+
+data_responsend <- lapply(files_all_nodist, read.csvnc)
+data_responsend <- bind_rows(data_responsend)
+data_responsend$region[data_responsend$region == "Nthotago"] <- "North Otago"
+data_responsend$region[data_responsend$region == "Banks"] <- "Banks Peninsula"
+data_responsend$region[data_responsend$region == "Stewart"] <- "Stewart Island"
+data_responsend$region[data_responsend$region == "Otago"] <- "Otago Peninsula"
+data_responsend$region[data_responsend$region == "SI"] <- "South Island"
+
+# Determining xlim for all env predictors to clip response curves (prevent extrapolating into impossible values)
+envminmax_nd <- envminmax %>% filter(envminmax$short != "distcolony") %>%
+  mutate(short = paste(short, "nodist", sep = "_"))
+
+# For each environmental variable, apply function responseCurves, see chunk at beginning of script
+# There is probably a better way to do this
+envnam_nd <- vector('list')
+j <- 0
+for(i in unique(envminmax_nd$short)){
+  axis.size <- ifelse(i == "sst_mean_nodist" |i == "sf_do_nodist" , 10, 12)
+  pp <- responseCurves2(data_responsend, i, envminmax_nd, colscale2, axis.size)
+  assign(paste(i, "rp", sep = "_"), pp, .GlobalEnv)
+  j <- j+1
+  envnam_nd[[j]] <- pp
+}
+
+# Getting legend for plot
+lg1 <- ggplot(data_response[data_response$variable == "bathymetry",], aes(x = x, y = y, group = region, color = region)) +
+  geom_line(size = 1.25) +
+  scale_color_manual(values = colscale2) +
+  labs(color = "Models (nb)") +
+  theme(legend.position = "right")
+lg1 <- gtable_filter(ggplot_gtable(ggplot_build(lg1)), "guide-box") 
+envnam[[11]] <- envnam_nd[[10]] <- lg1
+
+joint_resplot_nd <- ggarrange(plotlist = envnam_nd,  
+                              nrow = 3, 
+                              ncol = 4, 
+                              labels = c("a", "b", "c", "d", "e", "f", "g", "h", "i", ""),
+                              align = "hv", 
+                              label.x = 0.17, 
+                              label.y = 0.98)
+joint_resplot_nd <- annotate_figure(joint_resplot_nd, left = text_grob("Probability of Presence",
+                                                                       size = 12, rot = 90))
+joint_resplot_nd
+ggsave(plot = joint_resplot_nd,
+       filename = paste("Maxent/Plots_outputs/joint_nodist_responsecurves.png", sep = ""),
+       device = "png", width = 11, height = 7, dpi = 600)
+
+joint_resplotnd2 <- ggarrange(plotlist = envnam_nd,  
+                              nrow = 3, 
+                              ncol = 4)
+joint_resplotnd2 <- annotate_figure(joint_resplotnd2, left = text_grob("Probability of Presence", 
+                                                                       size = 12, rot = 90))
+
+agg_tiff("Maxent/Plots_outputs/Frontiers_Plots/Fig5.png",
+         res = 300, width = 180, height = 100, units = "mm", scaling = 1/1.45)
+plot(joint_resplotnd2)
+dev.off()
+```
+```{r f-rescurve-combo-nd, eval=TRUE, include=TRUE, fig.cap=cap_rescurv_nd}
+knitr::include_graphics("joint_nodist_responsecurves.png")
+```

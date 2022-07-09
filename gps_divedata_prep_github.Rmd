@@ -1,0 +1,982 @@
+---
+title: "GPS/TDR Data Preparation- Interpolation and Dive Analysis: Hickcox et al. 2022"
+output: html_notebook
+author: Rachel Hickcox
+email: rphickcox@gmail.com
+date: 2018-2022
+editor_options: 
+  chunk_output_type: inline
+---
+
+### Load packages 
+```{r}
+pkgs <- c("tidyr", "plyr", "raster", "dismo", "maptools", "ggplot2", "sp",
+          "rgeos", "rgeos", "rgdal", "gdalUtils", "stringr", "sdm", "lubridate", "dplyr", 
+          "spThin", "diveMove", "adehabitatHR", "data.table", "reshape2", "tlocoh", 
+          "knitr", "flextable", "here", "argosfilter")
+invisible(lapply(pkgs, library, character.only = TRUE))
+options(scipen = 999)
+```
+
+### Loading map files
+```{r}
+nztm <- CRS("+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+nzmg2000 <- CRS("+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs")
+local.tz <- "Pacific/Auckland"
+nz <- shapefile("NZ_polygon_NZTM2000_75kextent.shp")
+nz <- spTransform(nz, nztm)
+nz_marine <- shapefile("nz_polygon_nztm2000_water75.shp")
+nz_marine <- spTransform(nz_marine, nztm)
+bathymetry <- raster("bathymetry_formapping.tif")
+
+# Data not provided as sensitive information
+# Sites contains location information for the breeding sites
+sites <- fread("YEP site coordinates.csv", 
+               data.table = FALSE, 
+               showProgress = TRUE)
+sort(unique(sites$site_name))
+```
+
+### 2020-2021 BREEDING data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/2019-2020 GPS DATA/"
+folder_out <- "Distribution Points/Breeding 2020-2021/"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+```
+
+### 2019-2020 BREEDING data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/2019-2020 GPS DATA/"
+folder_out <- "Distribution Points/Breeding 2019-2020/"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+```
+
+### 2020 PREMOULT/WINTER data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/2019-2020 GPS DATA/"
+folder_out <- "Distribution Points/Premoult Winter 2020/"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+```
+
+### 2018 WINTER data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/WINTER 2018"
+folder_out <- "Distribution Points/Winter 2018"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+```
+
+### 2018 PREMOULT data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/PREMOULT 2018"
+folder_out <- "Distribution Points/Premoult 2018"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+```
+
+### 2017 WINTER data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/WINTER 2017"
+folder_out <- "Distribution Points/Winter 2017"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+
+# These files, when converted from ARD to CSV, filled empty rows with the data from the previous minute
+# Need to filter based on timestamp, see below **UNCOMMENT LINES!
+```
+
+### 2017 PREMOULT data
+```{r}
+# These change depending on the folder
+folder_in <- "G:/PREMOULT 2017"
+folder_out <- "Distribution Points/Premoult 2017"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+
+# These files, when converted from ARD to CSV, filled empty rows with the data from the previous minute
+# Need to filter based on timestamp, see below **UNCOMMENT LINES!
+```
+
+<!-- ###################### PREMOULT/WINTER/BREEDING AXY ################### -->
+***
+### PREMOULT/WINTER/BREEDING AXY
+#### To use with Ayxdepth ARD files converted to csv
+1. Reads in raw TDR + GPS data, filters for points with a depth (TDR) or a coordinate (GPS) -> cc
+2. Changes depth of Inactive/Dry records to NA (bird is not moving and out of water) -> tdrd
+3. Filters coordinates in the ocean with groundspeed <=7.4, satellite_count >4 -> marine
+4. Calculates the number of trips per individual (>6 hours, 28000 sec between points -> marine, marine_df
+5. Creates a ltraj variable (adehabitatLT) of marine_df (GPS points) and interpolates points to 1 minute -> traj_red, df_traj; from http://www.r-gators.com/2018/01/31/wildlife-tracking-data-in-r/
+6. Dive analysis (diveMove) of tdrd (TDR), calculated statistics for each dive -> calTDR, tdrX.tab
++ ZOC of  3 m, dives > 3m
+7. Extracts seafloor temperature (end of descent), sea surface temperature (beginning of descent)  ->  tdrX.tab
+8. Determines coordinate for each dive by rounding the mean of start/end time of each dive to the nearest minute and merging tdrX.tab (dives) and df_traj (GPS points) at that time -> point_dive
+9. Filters interpolated dive/GPS to only dive events -> point_dive
+10. Extracts  bathymetry data for each dive/point -> bathy_extract
+11. Calculates distance to land (nz polygon) and distance to nesting area (site point) -> point_bathy
+12. Calculates relative dive depth RDD; max depth/bathymetry depth -> point_bathy
++ See https://www.int-res.com/articles/meps/207/m207p171.pdf; Mattern et al 2013
+13. Classifies dives -> point_bathymetry
++ RDD % >= 75% & bottom time >= 15 sec == benthic == "2"
++ All others == non-benthic ==”1”
+14. Calculates difference in max depth between dives; if depth change <10, classifies as a repeated dive (rmd) -> point_bathy
+15. Creates a ltraj variable (adehabitatLT) to calculate distance between points, squared net displacement (R2n), absolute angle, relative angle -> point_traj, point_trajdf, point_bathy
+16. Calculates a bunch of dive metrics for each trip and for all trips -> xx
+17. Filters interpolated dive/GPS data (point_bathy) to only benthic dives -> only_b
+18. Subsets interpolated dive/GPS data (point_bathy) and benthic dive/GPS data (only_b) to ID/X/Y only for Maxent -> maxent, maxent_benthic
+```{r}
+# These change depending on data file 
+i <- 1L 
+
+# Needs to match a "Site Name" column in sites
+# UNCOMMENT AS REQUIRED
+#bsite <- "Nugget Point- Kaimataiti" 
+#bsite <- "Aramoana Beach"
+#bsite <- "Bobby's Head"
+#bsite <- "Penguin Bay"
+#bsite <- "Otapahi"
+#bsite <- "Long Point"
+#bsite <-"Nugget Point- Roaring Bay" 
+#bsite <- "Victory Beach" 
+#bsite <- "Bushy Beach"
+#bsite <- "Double Bay"
+#bsite <- "Papanui Beach"
+#bsite <- "Long Point-Seal Bay"
+#bsite <- "Haywards Point"
+#bsite <- "Otanerito"
+#bsite <- "Groper Island"
+#bsite <- "Pigeonhouse Bay"
+
+###############################
+# Df of file names from wd used to assign microchip number/sex,year, season assigned to variables
+toread <- files_list[i]
+nam <- unlist(strsplit(toread, "_"))
+year <- unlist(strsplit(nam[[3]], "[.]"))
+year <- paste(str_sub(year[[1]], 1, 7 ))
+season <- paste(nam[[2]])
+season <- toupper(season)
+nam <- unlist(strsplit(nam[[1]], "/"))
+nam <- paste(nam[[length(nam)]])
+nam <- toupper(nam)
+
+# Reading in raw TDR data
+cc <- fread(files_list[i], 
+            data.table = FALSE, sep = ",", fill = TRUE)
+cc <- cc[1:16]
+
+# Deleting column called Metadata, if present
+if ("Metadata" %in% colnames(cc)) {
+  cc$Metadata <- NULL # This line may throw an error, just watch out
+} else if ("metadata" %in% colnames(cc))  {
+  cc$metadata <- NULL # This line may throw an error, just watch out
+}
+
+if ("Sensor.Raw" %in% colnames(cc)) {
+  cc$Sensor.Raw <- NULL
+} else if ("sensor.raw" %in% colnames(cc)) {
+  cc$sensor.raw <- NULL
+} else if ("sensor raw" %in% colnames(cc)) {
+  cc$sensor.raw <- NULL
+} else if ("Sensor Raw" %in% colnames(cc)) {
+  cc$'Sensor Raw' <- NULL
+}
+
+names(cc) <- c("ID", "timestamp", "x", "y", "z", "activity", "depth", "temperature", 
+               "lat", "lon", "height_above_msl", "groundspeed", "satellite_count", 
+               "hdop", "max_signal", "battery_level") # Adds header with correct names
+cc <- filter(cc, (!is.na(cc$lat) | !is.na(cc$depth))) # Keeps rows with a coordinate or a depth
+
+# Adding NZDT timestamp column to cc 
+cc$timestamp_UTC <- parse_date_time(cc$timestamp, 
+                                    orders = c("Ymd HMS", "dmY HMS"),
+                                    tz = "UTC")
+cc$timestamp_NZDT <- with_tz(cc$timestamp_UTC, "Pacific/Auckland")
+cc$ID <- nam
+
+# FOR 2017 WINTER and PREMOULT DATA ONLY
+# Remove millisecond rows, keeping data for every second
+# cc$round <- trunc(cc$timestamp_NZDT,unit="secs")
+# cc <- cc[!duplicated(cc$round),]
+# cc$round <- NULL
+
+tdrd <- cc
+tdrd$depth[tdrd$activity == "Inactive/Dry"] <- NA
+tdrd$timeNZDT <- format(as.POSIXct(tdrd$timestamp_NZDT,format = "%d/%m/%Y %H:%M:%S"),"%H:%M:%S")
+tdrd$dateNZDT <- format(as.POSIXct(tdrd$timestamp_NZDT,format = "%d/%m/%Y %H:%M:%S"),"%d/%m/%Y")
+tdrd <- tdrd[order(tdrd$timestamp_NZDT),] 
+tdrd <- tdrd %>%
+  distinct(timestamp_NZDT, .keep_all = TRUE) #Removes rows duplicated timestamps
+
+# Saving TDR + GPS data @ device-specific intervals (usually 1 sec)
+fwrite(tdrd, 
+       file = paste0(folder_out, "/", paste(nam, season, year, "filter_tdr.csv", sep = "_")), 
+       row.names = FALSE)
+
+################### ORIGINAL GPS ONLY###########################################
+# Removing TDR data; coordinates only 
+cccord <- filter(cc, (!is.na(cc$lat) & !is.na(cc$lon))) # Removes rows lat and lon == NA
+cccord <- cccord %>%
+  filter(lon != 0) %>%  # Removes rows lon == 0
+  distinct(lon, lat, .keep_all = TRUE) #Removes rows duplicated lon values
+
+# Filtering cccord to remove points with a groundspeed > 7.4 and satellite count <4 (marine DF created)
+marine <- filter(cccord, cccord$groundspeed <= 7.4 | is.na(cccord$groundspeed))
+marine <- filter(marine, marine$satellite_count >= 3 | is.na(marine$satellite_count)) 
+
+# Duplicating coordinates in marine so they are retained after setting coordinates
+latlon <- data.frame(marine$lon,marine$lat) # Dataframe with just coordinates
+names(latlon) <- c("lon_1", "lat_1")
+marine <- cbind(marine, latlon) 
+
+# Making marine df a SpatialPointsDataFrame
+coordinates(marine) <- c("lon","lat") 
+crs(marine) <- nzmg2000 # lat long not Northing Easting 
+marine <- spTransform(marine, nztm)
+
+# Subsetting points to include only those that are within the ocean, saving
+# (some GPS devices were not turned off, so there are land points) 
+# Using the nz_marine polygon layer as a mask
+marine <- marine[nz_marine, ]
+plot(marine)
+
+# Calculating the number of trips and creating a df with total trip numbers for each individual
+marine_df <- data.frame(marine)
+marine_df <- marine_df[order(marine_df$timestamp_NZDT),] 
+marine_df$interval <- c(NA, diff(marine_df$timestamp_NZDT))
+marine_df$trips <- cumsum(c(TRUE, marine_df$interval[-1] > 21600)) # 6 hours
+marine_df$optional <- NULL
+write.csv(marine_df, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "marinesub.csv", sep = "_")), 
+          row.names = FALSE)
+
+################### ORIGINAL GPS + INTER GPS ###################################
+# Creating ltraj (adehabitatLT)
+# Calculating distance between points, net squared displacement (R2n), abs. angle, relative angle
+trajectory <- as.ltraj(xy = cbind(marine_df$lon, marine_df$lat),
+                       date = marine_df$timestamp_NZDT,
+                       id = marine_df$ID,
+                       burst = marine_df$trips,
+                       typeII = TRUE, 
+                       proj4string = nztm)
+
+# Regularisation of movement trajectory to every 1 minutes  
+# Settings on GPS to take location every 60 sec
+refda <- round_date(min(marine_df$timestamp_NZDT, na.rm = TRUE), unit = "minute") # The reference time stamp
+traj_na <- setNA(trajectory, refda, 1, units = "min") # Adds NA values every 60 sec
+traj_eq <- sett0(traj_na, refda, 1, units = "min")  # Rounds each interval to nearest min
+traj_int <- redisltraj(na.omit(traj_eq), 60, type = "time") # Linearly interpolates points every 1 min
+#X11(type = "Xlib")
+#trajdyn(traj_red)
+df_traj <- ld(traj_int) # ltraj to dataframe  
+df_traj <- df_traj[!is.na(df_traj$x), ]
+df_traj <- df_traj[!is.na(df_traj$y), ]
+df_traj$burst <- as.numeric(as.character(df_traj$burst))
+df_traj <- df_traj[order(df_traj$burst), ] 
+traj_red <- dl(df_traj) # Dataframe to ltraj  
+plot(traj_red)
+#plot(traj_red[1])
+
+write.csv(df_traj,
+          file = paste0(folder_out, "/", paste(nam, season, year, "interpgps.csv", sep = "_")), 
+          row.names = FALSE)
+
+################### DIVE DATA ##################################################
+# Dive analysis starts, using tdrd (TDR data)
+tdrfem <- createTDR(tdrd$timestamp_NZDT, 
+                    tdrd$depth, 
+                    concurrentData = data.frame(tdrd$temperature), 
+                    speed = FALSE, 
+                    file = "tdr")
+
+# No offset required; looking at plot of depths, offset was <0.5m at surface
+calTDR <- calibrateDepth(tdrfem, 
+                         dive.thr = 3,
+                         zoc.method = "offset",
+                         offset = 0,
+                         descent.crit.q = 0,
+                         ascent.crit.q = 0.01,
+                         dive.model = "smooth.spline",
+                         knot.factor = 20,
+                         smooth.par = 0.4,
+                         dry.thr = 21600) # If duration of dry time is < 6 hours, phase changed to wet 
+tdrX <- diveStats(calTDR, depth.deriv = FALSE) # phase.no does not always identify different trips...
+stamps <- stampDive(calTDR, ignoreZ = TRUE) # This results in times labeled as GMT...
+tdrX.tab <- data.frame(stamps, tdrX)
+#plotTDR(calTDR, what = "phases", diveNo = 200:210)
+plotTDR(calTDR, what = "phases")
+
+# plot(traj_red)
+# table(marine_df$trips)
+
+# Adding dive number to df
+tdrX.tab$diveno <- seq(1:nrow(tdrX.tab))
+
+# Extracting temperature from TDR data at the end of the descent (sea floor)
+tempdf <- data.frame(cc$timestamp_NZDT, cc$temperature)
+tdrX.tab <- merge(tempdf, 
+                  tdrX.tab, 
+                  by.x = "cc.timestamp_NZDT", 
+                  by.y = "enddesc", 
+                  all = FALSE)
+names(tdrX.tab)[1] <- "enddesc"
+names(tdrX.tab)[2] <- "seafloor_temp"
+
+# Extracting temperature from TDR data at beginning of the descent (sea surface)
+tdrX.tab <- merge(tempdf, 
+                  tdrX.tab, 
+                  by.x = "cc.timestamp_NZDT", 
+                  by.y = "begdesc", 
+                  all = FALSE)
+names(tdrX.tab)[1] <- "begdesc"
+names(tdrX.tab)[2] <- "sst"
+
+################### DIVE DATA + INTER GPS ######################################
+# Calculating the mean of the start time and end time of the dive, rounding to nearest minute
+# Merging TDR data with interpolated GPS points
+# Filtering merged data to include only dive events
+# Some dives at the beginning/end of trip are removed because there was no interpolated x/y
+tdrX.tab$timemean <- do.call(c, Map(function(x, y) mean(c(x,y)), 
+                                    tdrX.tab$begdesc,
+                                    tdrX.tab$begasc))
+tdrX.tab$timemean_round <- round_date(tdrX.tab$timemean, 
+                                      unit = "minute") # Dive df
+df_traj$timemean_round <- round_date(df_traj$date, 
+                                     unit = "minute") # Interpolated GPS df
+point_dive <- merge(tdrX.tab, 
+                    df_traj, 
+                    by = "timemean_round", 
+                    all = TRUE)
+point_dive <- point_dive %>%
+  filter(!is.na(phase.no)) %>%
+  filter(!is.na(x))
+point_dive <- point_dive[c(35, 25, 26, 36, 6, 23, 7, 2, 4, 10:22, 5, 3, 24, 1)]
+names(point_dive) <- c("ID", "x", "y", "trip.no", "phase.no", "dive.no", "activity", 
+                       "begdesc", "enddesc",  "begasc", "desctim", "botttim", 
+                       "asctim", "divetim", "descdist", "bottdist", "ascdist", 
+                       "bottdep.mean", "bottdep.median", "bottdep.sd", "maxdep", 
+                       "postdive.dur", "sf_temp", "ss_temp", "dtime.mean", "dtime.round")
+
+# Extracting  bathymetry data for each point
+shpoint_dive <- point_dive
+coordinates(shpoint_dive) <- ~x + y
+crs(shpoint_dive) <- nztm
+bathy_extract <- raster::extract(bathymetry, 
+                                 shpoint_dive, 
+                                 fun = max, 
+                                 na.rm = TRUE)
+
+# Distance to breeding area, distance to land
+dist_land <- gDistance(nz, 
+                       shpoint_dive, 
+                       byid = TRUE)
+bsite_coord <- sites[sites$site_name == bsite,]
+coordinates(bsite_coord) <- ~x + y
+crs(bsite_coord) <- nztm
+dist_nest <- gDistance(bsite_coord, 
+                       shpoint_dive, 
+                       byid = TRUE)
+point_bathy <- cbind(point_dive, bathy_extract, dist_land, dist_nest)
+names(point_bathy)[28:29] <- c("dist_land", "dist_nest")
+
+# Using max depth to determine relative dive depth (RDD; max depth/bathymetry depth)
+# RDD > 100% means max depth was greater than bathymetry
+point_bathy$bathy_extract[point_bathy$bathy_extract > 0] <- 0
+point_bathy <- point_bathy %>%
+  mutate(relative_depth = maxdep / abs(bathy_extract)) %>%
+  mutate(relative_depth = replace(relative_depth, relative_depth == Inf, NA)) %>%
+  mutate(relative_depth_percent = relative_depth * 100)
+
+# Classifying dive as benthic or non-benthic based on max depth AND botttime
+point_bathy$type <- "non-benthic"
+point_bathy$type[point_bathy$relative_depth_percent >= 75 & 
+                   (point_bathy$botttim >= 15 | is.na(point_bathy$botttim))] <- "benthic"
+point_bathy$typenum[point_bathy$type == "non-benthic"] <- 1
+point_bathy$typenum[point_bathy$type == "benthic"] <- 2
+point_bathy <- point_bathy %>%
+  mutate(depth_change = (maxdep - lag(maxdep)) / lag(maxdep) * 100) %>%
+  mutate(rmd = ifelse(abs(depth_change) <= 10, "rmd", ifelse("na")))
+
+# Recalculating dist/angle/step length for interpolated dive data 
+point_traj <- as.ltraj(xy = cbind(point_bathy$x, point_bathy$y),
+                       date = point_bathy$dtime.mean,
+                       id = point_bathy$ID,
+                       burst = point_bathy$trip.no,
+                       typeII = TRUE, 
+                       proj4string = nztm)
+point_trajdf <- ld(point_traj) # ltraj to dataframe  
+point_bathy <- data.frame(point_bathy, point_trajdf$dist)
+names(point_bathy)[36] <-  "distance.m"
+
+write.csv(point_bathy, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "alldives.csv", sep = "_")), 
+          row.names = FALSE)
+#plot(point_bathy$x, point_bathy$y)
+#plot(nz, add = T)
+
+################### METRICS DIVE DATA + INTER GPS ##############################
+# If these need to be recalculated, read in the alldives.csv files 
+xx <- data.frame()
+for (i in unique(point_bathy$trip.no)) {
+  dfx <- point_bathy[point_bathy$trip.no == i,]
+  # Dive metric calculations for each trip
+  tripno <- i
+  n <- nrow(dfx)
+  duration_h <- as.double(difftime(dfx[nrow(dfx), 10], dfx[1, 8]), 
+                          units = "hours") # From first dive to last dive event
+  trip_days <- length(unique(day(dfx$begdesc))) # How many days the trip contains; identify overnight trips
+  dis_travelkm <- sum(dfx$distance.m, na.rm = TRUE)/1000
+  benthic_per <- length(which(dfx$type == "benthic")) / n
+  dfreq <- n / duration_h
+  horspeed <- dis_travelkm / duration_h
+  ddur <- mean(dfx$divetim, na.rm = TRUE)
+  ddur_sd <- sd(dfx$divetim, na.rm = TRUE)
+  botttime <- mean(dfx$botttim, na.rm = TRUE)
+  botttime_sd <- sd(dfx$botttim, na.rm = TRUE)
+  postin <- mean(dfx$postdive.dur, na.rm = TRUE)
+  postin_sd <- sd(dfx$postdive.dur, na.rm = TRUE)
+  meandepth <- mean(dfx$maxdep, na.rm = TRUE)
+  meandepth_sd <- sd(dfx$maxdep, na.rm = TRUE)
+  maxdepth <- max(dfx$maxdep, na.rm = TRUE)
+  maxdepth_sd <- sd(dfx$maxdep, na.rm = TRUE)
+  effort <- mean(dfx$divetim / (dfx$divetim + dfx$postdive.dur), na.rm = TRUE)
+  effort_sd <- sd(dfx$divetim / (dfx$divetim + dfx$postdive.dur), na.rm = TRUE)
+  effic <- mean(dfx$botttim / (dfx$divetim + dfx$postdive.dur), na.rm = TRUE)
+  effic_sd <- sd(dfx$botttim / (dfx$divetim + dfx$postdive.dur), na.rm = TRUE)
+  sftemp <- mean(dfx$sf_temp, na.rm = TRUE)
+  sftemp_sd <- sd(dfx$sf_temp, na.rm = TRUE)
+  ssttemp <- mean(dfx$ss_temp, na.rm = TRUE)
+  ssttemp_sd <- sd(dfx$ss_temp, na.rm = TRUE)
+  dist_land_max <- max(dfx$dist_land, na.rm = TRUE)/1000
+  dist_land_mean <- mean(dfx$dist_land, na.rm = TRUE)/1000
+  dist_land_sd <- sd(dfx$dist_land, na.rm = TRUE)/1000
+  dist_nest_max <- max(dfx$dist_nest, na.rm = TRUE)/1000
+  dist_nest_mean <- mean(dfx$dist_nest, na.rm = TRUE)/1000
+  dist_nest_sd <- sd(dfx$dist_nest, na.rm = TRUE)/1000
+  relative_dive <- mean(dfx$relative_depth_percent, na.rm = TRUE)
+  relative_dive_sd <- sd(dfx$relative_depth_percent, na.rm = TRUE)
+  
+  xx <- rbind(xx, data.frame(tripno, n, duration_h, trip_days, dis_travelkm, 
+                             benthic_per, dfreq, horspeed, ddur, ddur_sd, botttime, 
+                             botttime_sd, postin, postin_sd, meandepth, meandepth_sd, 
+                             maxdepth, effort, effort_sd, effic, effic_sd, sftemp, sftemp_sd, 
+                             ssttemp, ssttemp_sd, dist_land_max, dist_land_mean, dist_land_sd, 
+                             dist_nest_max, dist_nest_mean, dist_nest_sd, relative_dive, relative_dive_sd))
+}
+assign(paste(nam, "stats", sep = "_"), xx)
+
+# Calculating stats of all trips and adding to xx df
+n_sum <- sum(xx$n) # Number of dives/GPS points
+n_trips <- max(xx$tripno) # Number of trips
+all_stats <- rbind((colwise(mean)(xx)), 
+                   (colwise(max)(xx)), 
+                   (colwise(min)(xx)),
+                   (colwise(sd)(xx)))
+all_stats$tripno <- c("tot_mean", "tot_max", "tot_min", "tot_sd")
+xx <- rbind(xx, all_stats)
+xx <- data.frame(ID = nam, season = season, xx[1], round(xx[2], 0), round(xx[3:33], 2))
+
+write.csv(xx, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "divestats.csv", sep = "_")), 
+          row.names = FALSE)
+
+################### SAVING EVERYTHING ##########################################
+# Filtering dives to only benthic
+only_b <- filter(point_bathy, point_bathy$type == "benthic")
+n_benthic <- nrow(only_b) # Number of benthic points
+n_interp <- nrow(df_traj) # Number of interpolated GPS points (for HR analysis)
+# Prints ID, total trips, total dives, total benthic dives, total interpolated points (1 minute)
+paste(nam, season, n_trips, n_sum, n_benthic, n_interp) 
+
+# Saving all variables  
+write.csv(only_b, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "benthicdives.csv", sep = "_")), 
+          row.names = FALSE)
+
+maxent <- data.frame("ID" = point_bathy$ID, 
+                     "lon" = point_bathy$x,
+                     "lat" = point_bathy$y)
+maxent_benthic <- data.frame("ID" = only_b$ID,
+                             "lon" = only_b$x, 
+                             "lat" = only_b$y)
+write.csv(maxent, 
+          file = paste0(folder_out, "/", paste(nam, season, year,  "maxent.csv", sep = "_")), 
+          row.names = FALSE)
+
+write.csv(maxent_benthic, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "maxent_benthic.csv", sep = "_")), 
+          row.names = FALSE)
+
+# Some code to visualize tracks, dives, etc.
+# paste(nam, season, n_trips, n_sum, n_benthic, n_interp) 
+# plotTDR(calTDR, what = "phases", interact = FALSE)
+# plot(marine)
+# plot(bsite_coord, add=T, col = "red")
+# plot(nz, add=T)
+# plot(marine_df$lon, marine_df$lat)
+# plot(maxent$lon, maxent$lat)
+# plot(maxent_benthic$lon, maxent_benthic$lat, col = "red")
+# plot(point_bathy$x, point_bathy$y)
+# plot(nz, add=T)
+```
+<!-- ######################### MOVEBANK 2018-2020 ########################## -->
+***
+### MOVEBANK 2018-2020 
+#### Formatted differently
+#### Single CSV of data to be split
+1. Reads in raw csv will all individuals -> movebank
+2. Filters to non-NA GPS data and extracts ID (MC number) from ID column -> cc
+3. Removes duplicates and transforms timestamp -> cccord
+4. Filters coordinates in the ocean with groundspeed <=7.4, satellite_count >=3 -> marine
+5. Creates df with ID, lon, lat for maxent -> maxent
+6. Splits df and maxent df into individual IDs, assigns to variable, saves
+```{r}
+# These change depending on the folder
+folder_in <- "G:/Datasets"
+folder_out <- "Distribution Points/Movebank 2018-2020"
+###############################
+
+# Original datafile downloaded from Movebank read and filtered; saved with original timestamp
+# Data DOES NOT have TDR data
+movebank <- read.csv("gps points 2018_2020.csv", header = TRUE)
+cc <- Filter(function(movebank) !all(is.na(movebank)), movebank) # Filter columns that are all NA
+cc <- data.frame(cc$individual.local.identifier, cc$timestamp, cc$location.lat, 
+                 cc$location.long, cc$bar.barometric.height, cc$ground.speed, 
+                 cc$gps.satellite.count, cc$gps.hdop)
+
+names(cc) <- c("ID", "timestamp", "lat", "lon", "height_above_msl", "groundspeed",
+               "satellite_count", "hdop") # Adds header with correct names
+
+# Extracting correct ID (MC number) from ID column
+# There is probably a nicer way to do this (pipes?) 
+cc$sex <- str_extract(cc$ID, "female")
+cc$sex[is.na(cc$sex)] <- "male"
+cc$sex <- substr(cc$sex, 0, 1) # Shortens sex to 1 letter
+cc$mc <- gsub("[^0-9.]", "", cc$ID) # Extracts MC number
+cc$ID <- str_c(cc$sex, cc$mc) 
+cc$sex <- NULL
+cc$mc <- NULL
+
+cccord <- filter(cc, (!is.na(cc$lat) & !is.na(cc$lon))) # Removes rows lat and lon == NA
+cccord <- filter(cccord, cccord$lon != 0)  # Removes rows lon == 0
+cccord <- filter(cccord, !(duplicated(cccord$lon))) #Removes rows duplicated lon values
+
+write.csv(cccord, 
+          file = paste(folder_out, "Movebank_filter.csv", sep = "/"),
+          row.names = FALSE)
+
+# Adding NZDT timestamp column to cccord, saving 
+dd <- parse_date_time(cccord$timestamp, orders = c("Ymd HMS", "dmY HMS"))
+cccord$timestamp_UTC <- dd
+cccord$timestamp_NZDT <- with_tz(cccord$timestamp_UTC, local.tz)
+
+write.csv(cccord, 
+          file = paste(folder_out, "Movebank_filter_ts.csv", sep = "/"),
+          row.names = FALSE) # Original filtered lat/lon data with UTC and NZDT timestamp columns formatted
+
+# Filtering cccord to remove points with a groundspeed >= 7.4 and satellite count <4 (marine DF created)
+marine <- filter(cccord, cccord$groundspeed <= 7.4 | is.na(cccord$groundspeed))
+marine <- filter(marine, marine$satellite_count >= 4 | is.na(marine$satellite_count)) 
+
+# Duplicating coordinates in cccord so they are retained after setting coordinates
+latlon <- data.frame(marine$lon, marine$lat) #dataframe with just coordinates
+names(latlon) <- c("lon_1", "lat_1")
+marine <- cbind(marine, latlon) 
+
+# Makes marine df a SpatialPointsDataFrame
+coordinates(marine) <- c("lon","lat") 
+crs(marine) <- nzmg2000 #lat long not Northing Easting 
+marine <- spTransform(marine, nztm)
+
+# Subsetting points to include only those that are within the ocean, saving
+# (some GPS devices were not turned off, so there are land points) 
+# Using the nz_marine polygon layer as a mask
+marine <- marine[nz_marine, ]
+marine_df <- data.frame(marine)
+
+write.csv(marine, 
+          file = paste(folder_out, "Movebank_marinesub.csv", sep = "/"),
+          row.names = FALSE)
+
+# Creating/saving a df with ID, lon, lat for maxent
+maxent <- data.frame("ID" = marine$ID, "lon" = marine$lon, "lat" = marine$lat)
+
+write.csv(maxent, 
+          file = paste(folder_out, "Movebank_maxent.csv", sep = "/"),
+          row.names = FALSE)
+
+# Splitting df into individual IDs and assigning to variable, saving
+s <- split(marine_df, marine_df$ID) # Split the df by ID
+list2env(s, envir = .GlobalEnv) # Make individual df for each bird
+
+lapply(seq_along(s), function(i){
+  write.csv(s[[i]], 
+            paste0(folder_out, "/", s[[i]][1,1], "_", year(s[[i]][1,9]), ".csv", sep = ""), 
+            row.names = FALSE)
+})
+```
+
+#### Individual Movebank csv with GPS points created above read in 
+1. Calculates the number of trips per individual (>6 hours, 28000 sec between points -> cc
+2. Creates a ltraj variable (adehabitatLT) of cc (GPS points) and interpolates points to 1 minute -> traj_red, df_traj 
+```{r}
+# These change depending on the folder
+folder_in <- "Distribution Points/Movebank 2018-2020"
+folder_out <- "Distribution Points/Movebank 2018-2020"
+files_list <- list.files(folder_in, pattern = "*.csv", full.names = TRUE, recursive = TRUE)
+
+###############################
+i <- 1L
+
+# Df of file names from wd used to assign microchip number/sex,year, season assigned to variables
+toread <- files_list[i]
+nam <- unlist(strsplit(toread, "_"))
+year <- unlist(strsplit(nam[[3]], "[.]"))
+year <- paste(str_sub(year[[1]], 1, 7 ))
+season <- paste(nam[[2]])
+season <- toupper(season)
+nam <- unlist(strsplit(nam[[1]], "/"))
+nam <- paste(nam[[length(nam)]])
+nam <- toupper(nam)
+
+# Reading in GPS data that was formatted and split above
+cc <- fread(files_list[i], 
+            data.table = FALSE, 
+            showProgress = TRUE, 
+            sep = ",")
+
+# Formatting timestamp
+cc$timestamp_NZDT <- parse_date_time(cc$timestamp_NZDT, 
+                                     orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                                     tz = local.tz)
+
+# Makes marine df a SpatialPointsDataFrame
+coordinates(cc) <- ~lon + lat
+crs(cc) <- nzmg2000 #lat long not Northing Easting 
+cc <- spTransform(cc, nztm)
+
+# Subsetting points to include only those that are within the ocean, saving
+# (some GPS devices were not turned off, so there are land points) 
+# Using the nz_marine polygon layer as a mask
+cc <- cc[nz_marine, ]
+cc <- data.frame(cc)
+
+# Calculating the number of trips and creating a df with total trip numbers for each individual
+cc <- cc[order(cc$timestamp_NZDT),] 
+cc$interval <- difftime(cc$timestamp_NZDT,lag(cc$timestamp_NZDT), units = "secs")
+cc$trips <- cumsum(c(TRUE, cc$interval[-1] > 21600)) # 6 hours
+cc$optional <- NULL
+#cc <- cc[cc$trip != 2,]
+#plot(cc$lon, cc$lat, col = ifelse(cc$trips == 1, "red", NA))
+
+write.csv(cc, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "marinesub.csv", sep = "_")), 
+          row.names = FALSE)
+
+# Creating df with ID, lon, lat for maxent
+maxent <- data.frame("ID" = cc$ID, "lon" = cc$lon, "lat" = cc$lat)
+
+write.csv(maxent, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "maxent.csv", sep = "_")), 
+          row.names = FALSE)
+
+################### ORIGINAL GPS + INTER GPS ###################################
+# Creating ltraj (adehabitatLT)
+# Calculating distance between points, net squared displacement (R2n), abs. angle, relative angle
+trajectory <- as.ltraj(xy = cbind(cc$lon, cc$lat),
+                       date = cc$timestamp_NZDT,
+                       id = cc$ID,
+                       burst = cc$trips,
+                       typeII = TRUE, 
+                       proj4string = nztm)
+
+# Regularisation of movement trajectory to every 1 minutes  
+# Settings on GPS to take location every 60 sec
+refda <- round_date(min(cc$timestamp_NZDT), unit = "minute") # The reference time stamp
+traj_na <- setNA(trajectory, refda, 1, units = "min") # Adds NA values every 60 sec
+traj_eq <- sett0(traj_na, refda, 1, units = "min")  # Rounds each interval to nearest min
+traj_int <- redisltraj(na.omit(traj_eq), 60, type = "time") # Linearly interpolates points every 1 min
+df_traj <- ld(traj_int) # ltraj to dataframe  
+df_traj <- df_traj[!is.na(df_traj$x), ]
+df_traj <- df_traj[!is.na(df_traj$y), ]
+df_traj$burst <- as.numeric(as.character(df_traj$burst))
+df_traj <- df_traj[order(df_traj$burst),] 
+traj_red <- dl(df_traj) # Dataframe to ltraj  
+
+write.csv(df_traj, 
+          file = paste0(folder_out, "/", paste(nam, season, year, "interpgps.csv", sep = "_")), 
+          row.names = FALSE)
+table(cc$trips)
+paste(nam, season, max(cc$trips), nrow(cc), nrow(df_traj))
+```
+
+<!-- ######################### 2003-2016 ########################## -->
+***
+### 2003-2016
+#### Formatted differently
+#### Includes trip number, dive number, dive time, max depth, benthic dive (0/1), distance to nesting area
+#### Single CSV of data to be split
+1. Reads in raw csv will all individuals
+2. Deletes records from unidentified birds
+3. Shortens sex to one letter
+4. Removes duplicates and transforms timestamp 
+5. Filters coordinates in the ocean
+6. Creates df with ID, lon, lat for maxent
+7. Splits df and maxent df into individual IDs, assigns to variable, saves
+```{r}
+# These change depending on the folder
+folder_out <- "Distribution Points/P2003-2016"
+mp <- read.csv("YEP-dive-positions-1992-2015.csv")
+
+###############################
+
+# Deletes points from unidentified birds and drops all factor levels that are now 0
+nogood <-c("GL0406", "GL0503","GL0506" , "GL0404" , "ROV")
+mp_sub <- mp[!(mp$bird %in% nogood),]
+mp_sub <- droplevels(mp_sub)
+
+mp_sub$Sex <- substr(mp_sub$Sex, 0, 1) # Shortens sex to 1 letter
+mp_sub$ID <- paste(mp_sub$Sex, mp_sub$bird, sep ="")
+
+cc <- mp_sub[c(15,10, 5:9, 11:14)]
+# Adds header with correct names
+names(cc) <- c("ID", "timestamp", "trip_no", "event_no", "lat", "lon", "GPSfixTimeDiff", 
+               "divetime", "depth", "bottom_dive", "home_distance") 
+
+# Adding NZDT timestamp column to cc, saving 
+dd <- parse_date_time(cc$timestamp, orders = c("Ymd HMS", "dmY HMS", "mdY HMS"))
+cc$timestamp_UTC <- dd
+cc$timestamp_NZDT <- with_tz(cc$timestamp_UTC, local.tz)
+
+write.csv(cc, 
+          file = paste0(folder_out, "mp_filter_ts.csv", sep = "/"), 
+          row.names=FALSE) # Original filtered lat/lon data with UTC, NZDT timestamp
+mp_sp <- cc
+
+# Duplicating coordinates in cc so they are retained after setting coordinates
+latlon <- data.frame(cc$lon, cc$lat) # Dataframe with just coordinates
+names(latlon) <- c("lon_1", "lat_1")
+mp_sp <- cbind(mp_sp, latlon) 
+
+coordinates(mp_sp) <- ~lon + lat # Makes df a SpatialPointsDataFrame
+crs(mp_sp) <- nzmg2000
+mp_sp <- spTransform(mp_sp, nztm)
+
+# Subsetting points to include only those that are within the ocean, saving
+# (some GPS devices were not turned off, so there are land points) 
+# Using the nz_marine polygon layer as a mask
+mp_sp <- mp_sp[nz_marine, ]
+mp_df <- data.frame(mp_sp)
+mp_df$optional <- NULL
+
+# Saving all points
+
+write.csv(mp_sp,                        
+          file = paste0(folder_out, "mp_alldata_NZTM.csv", sep = "/"), 
+          row.names = FALSE)
+
+# Creating/saving a df with ID, lon, lat for maxent
+maxent <- data.frame("ID" = mp_sp$ID, 
+                     "lon" = mp_sp$lon, 
+                     "lat" = mp_sp$lat)
+
+write.csv(maxent, 
+          file = paste0(folder_out, "mp_maxent.csv", sep = "/"), 
+          row.names = FALSE)
+
+# Splitting df into individual IDs and assigning to variable, saving
+s <- split(mp_df, mp_df$ID) # Split the df by ID
+list2env(s, envir = .GlobalEnv) # Make individual df for each bird
+
+lapply(seq_along(s), function(i){
+  write.csv(s[[i]], paste0(folder_out, "/", s[[i]][1,1], "_", "BREEDING", "_", year(s[[i]][1,11]), ".csv", sep = ""), 
+            row.names = FALSE)
+})
+
+# Splitting Maxent df into individual IDs, saving
+smaxent <- split(maxent, maxent$ID) # Split the df by ID
+
+lapply(seq_along(smaxent), function(i){
+  write.csv(smaxent[[i]], paste0(folder_out, "/", smaxent[[i]][1,1], "_", "BREEDING", "_", year(s[[i]][1,11]), "_maxent.csv", 
+                                 sep = ""), row.names = FALSE)
+}) # Because maxent files don't have a year column, using the s df year column
+
+###############################
+
+# Some individuals were tracked over multiple years and/or spanning Dec/Jan of 2 years
+# These points were split into years and saved
+# The following ID have multiple years; 
+todo <- list(m14355, m15441, m17935, m982009102641838)
+j <- 1L # This changes for each ID in todo
+
+assign("fixed", todo[[j]])
+nam <- unique(fixed$ID)
+fixed$year <- year(fixed$timestamp_NZDT)
+fixed$interval <- difftime(fixed$timestamp_NZDT, lag(fixed$timestamp_NZDT), units = "days")
+
+# Identifying where to split; if there is more than 5 days between points
+# Cannot just split by year because some span Dec/Jan of 2 years but are one tracking period
+fixed$split <- cumsum(c(TRUE, fixed$interval[-1] > 5))
+
+# Spitting and saving
+for(i in unique(fixed$split)) {
+  
+  dat <- fixed[fixed$split == i,]
+  year <- min(dat$year)
+  dat <- dat[1:15]
+  write.csv(dat, 
+            paste0(folder_out, "/", nam, "_", "BREEDING", "_", year, ".csv", sep = ""))
+  
+  maxent <- data.frame("ID" = dat$ID, "lon" = dat$lon, "lat" = dat$lat)
+  write.csv(maxent, 
+            paste0(folder_out, "/", nam, "_", "BREEDING", "_", year, "_maxent.csv", sep = ""))
+}
+```
+
+#### Individual Mattern csv with GPS points created above read in 
+1. Data rearranged to match format of axy code
+2. Creates a ltraj variable (adehabitatLT) of cc (GPS points) and interpolates points to 1 minute -> traj_red, df_traj 
+3. Creates df with ID, lon, lat for maxent -> maxent
+4. Splits df and maxent df into individual IDs, assigns to variable, saves
+```{r}
+# These change depending on the folder
+folder_in <- "P2003-2016"
+folder_out <- "P2003-2016_new"
+
+###############################
+
+setwd(folder_in)
+files_list <- list.files(pattern = ".csv", full.names = FALSE)
+files_list <- grep(files_list, pattern = 'maxent.csv', inv = T, value = T) # Removes maxent files
+files_list <- grep(files_list, pattern = 'BREEDING', value = T) # Removes all point files
+mp_sum <- data.frame()
+
+for(i in 1:length(files_list)) {
+  # Df of file names from wd used to assign microchip number/sex,year, season assigned to variables
+  toread <- files_list[i]
+  nam <- unlist(strsplit(toread, "_"))
+  year <- unlist(strsplit(nam[[3]], "[.]"))
+  year <- paste(str_sub(year[[1]]))
+  season <- paste(nam[[2]])
+  season <- toupper(season)
+  nam <- paste(nam[[1]])
+  nam <- toupper(nam)
+  
+  # File is loaded and assigned variable name according to filename
+  setwd(folder_in)  
+  cc <- fread(files_list[i], 
+              data.table = FALSE, 
+              showProgress = TRUE, 
+              sep = ",")
+  cc$optional <- NULL
+  if ("V1" %in% colnames(cc)) {
+    cc$V1 <- NULL # This line may throw an error, just watch out
+  }
+  
+  # Changing benthic/non-benthic classification to 1 and 2; adding column with "benthic"/"non-benthic" 
+  cc$bottom_dive[cc$bottom_dive == 1] <- 2
+  cc$bottom_dive[cc$bottom_dive == 0] <- 1
+  cc$type[cc$bottom_dive == 2] <- "benthic"
+  cc$type[cc$bottom_dive == 1] <- "non-benthic"
+  
+  cc <- cc[c(1, 14, 15, 3, 4, 10, 11, 6, 5, 7, 9, 16, 8)]
+  names(cc) <- c("ID", "x", "y", "trip.no", "dive.no", "timestamp_UTC", "timestamp_NZDT",
+                 "divetim", "GPSfixtimediff", "maxdep", "dist_nest", "type", "typenum")
+  
+  # Formatting timestamp
+  cc$timestamp_NZDT <- parse_date_time(cc$timestamp_NZDT, 
+                                       orders = c("Ymd HMS", "dmY HMS", "mdY HMS"),
+                                       tz = local.tz)
+  cc <- cc[order(cc$timestamp_NZDT),] 
+  
+  ################### ORIGINAL GPS + INTER GPS ###################################
+  # Creating ltraj (adehabitatLT)
+  # Calculating distance between points, net squared displacement (R2n), abs. angle, relative angle
+  trajectory <- as.ltraj(xy = cbind(cc$x, cc$y),
+                         date = cc$timestamp_NZDT,
+                         id = cc$ID,
+                         burst = cc$trip.no,
+                         typeII = TRUE, 
+                         proj4string = nztm)
+  
+  # Regularisation of movement trajectory to every 1 minutes  
+  refda <- round_date(min(cc$timestamp_NZDT), unit = "minute") # The reference time stamp
+  traj_na <- setNA(trajectory, refda, 1, units = "min") # Adds NA values every 60 sec
+  traj_eq <- sett0(traj_na, refda, 1, units = "min")  # Rounds each interval to nearest min
+  traj_int <- redisltraj(na.omit(traj_eq), 60, type = "time") # Linearly interpolates points every 1 min
+  df_traj <- ld(traj_int) # ltraj to dataframe  
+  df_traj <- df_traj[!is.na(df_traj$x), ]
+  df_traj <- df_traj[!is.na(df_traj$y), ]
+  df_traj$burst <- as.numeric(as.character(df_traj$burst))
+  df_traj <- df_traj[order(df_traj$burst),] 
+  traj_red <- dl(df_traj) # Dataframe to ltraj  
+  
+  # Saving everything
+  
+  write.csv(cc, 
+            file = paste0(folder_out, "/", paste(nam, season, year, "alldives.csv", sep = "_")), 
+            row.names = FALSE)
+  
+  only_b <- filter(cc, cc$type == "benthic")
+  write.csv(only_b, 
+            file = paste0(folder_out, "/", paste(nam, season, year, "benthicdives.csv", sep = "_")), 
+            row.names = FALSE)
+  
+  write.csv(df_traj, 
+            file = paste0(folder_out, "/", paste(nam, season, year, "interpgps.csv", sep = "_")), 
+            row.names = FALSE)
+  
+  maxent <- data.frame("ID" = cc$ID, "lon" = cc$x, "lat" = cc$y)
+  write.csv(maxent, 
+            file = paste0(folder_out, "/", paste(nam, season, year, "maxent.csv", sep = "_")), 
+            row.names = FALSE)
+  
+  maxent_benthic <- data.frame("ID" = only_b$ID, "lon" = only_b$x, "lat" = only_b$y)
+  write.csv(maxent_benthic, 
+            file = paste0(folder_out, "/", paste(nam, season, year, "maxent_benthic.csv", sep = "_")), 
+            row.names = FALSE)
+  
+  npoints <- data.frame(nam, season, max(cc$trip.no), nrow(cc), nrow(maxent_benthic), nrow(df_traj))
+  mp_sum <- rbind(mp_sum, npoints)
+}
+```
+
+**Output folders:**  
+
+* "Distribution Points"
++ Breeding 2018-2019 (all copied from Movebank 2018-2020 folder)
++ Breeding 2019-2020
++ Premoult 2017
++ Premoult 2018
++ Winter 2017
++ Winter 2018
++ Premoult Winter 2019
++ Premoult Winter 2020
++ P2003-2016_new
++ Movebank 2018-2020 (these were redistributed to correct season folders)
+* Each season folder contains individual folders for nesting sites
+
+* "Distribution Points_other"
++ All 2019-202_new
++ Movebank 2018-2020
+
+**Output files:**
+
+* *ID_season_year_ filter_tdr.csv*	
++ TDR + coordinates, NZDT timestamps (time and date), edited activity
+* *ID_season_year_marinesub.csv*
++ Coordinates, NZDT timestamps, trip numbers, filtered groundspeed <= 7.4 & Satellite count >=4, 
+no land points
+* *ID_season_year_alldives.csv*
++ Dive metrics for each dive, interpolated coordinates, trip number, extracted bathymetry, relative dive depth, dive type
+* *ID_season_year_divesstats.csv*
++ Dive metrics for each trip, all trips (see data prep.doc for more information)
+* *ID_season_year_interpgps.csv*
++ Interpolated coordinates (1 minute), NZDT timestamps, trip numbers, R2n, angle, step length, dist
++ To be used for HR analysis
+* *ID_season_year_benthicdives.csv*	
++ BENTHIC DIVES ONLY, dive metrics,interpolated coordinates, trip number, extracted bathymetry, relative dive depth, dive type
+* *ID_season_year_maxent.csv*
++ ID, X, Y from alldives
+* *ID_season_year_maxent_benthic.csv*
++ BENTHIC DIVES ONLY ID, X, Y from alldives 

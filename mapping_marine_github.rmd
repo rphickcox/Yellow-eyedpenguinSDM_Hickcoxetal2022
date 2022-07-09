@@ -1,0 +1,383 @@
+---
+title: "File Preparation for Mapping/Modeling- Environmental layers: Hickcox et al. 2022"
+output: html_notebook
+author: Rachel Hickcox
+email: rphickcox@gmail.com
+date: 2018-2022
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Load packages 
+```{r}
+# Install and load all packages provided from a character vector
+load_pkgs <- function(pkgs) {
+  new_pkgs <- pkgs[!(pkgs %in% installed.packages()[ , 'Package'])]
+  if (length(new_pkgs) > 0) install.packages(new_pkgs)
+  invisible(lapply(pkgs, function(x)
+    suppressMessages(library(x, character.only = TRUE)))
+  )
+}
+pkgs <- c("plyr", "dplyr", "raster", "dismo", "maptools", "ggplot2", "sp", "SDMTools", 
+          "rgeos","rgdal", "gdalUtils", "sf", "gstat", "scales", "tidyr", "stringr")
+load_pkgs(pkgs)
+```
+
+# Load all shapefiles/rasters and create a blank fishnet
+```{r}
+folder_out <- getwd()
+ext <- extent(1092142, 1790142, 4674234, 5447234)
+nztm <- CRS("+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+
+fishnet <- raster(ext, resolution = 500, crs = nztm)
+fishnet[] <- 1:ncell(fishnet)
+#writeRaster(fishnet, "fishnet500m.tif", overwrite = TRUE)
+
+nz <- shapefile("NZ_polygon_NZTM2000_75kextent.shp")
+nz_marine <- shapefile("nz_polygon_nztm2000_water75.shp")
+fishnet_sp <- shapefile("fishnet_75km_centroids.shp")
+```
+
+# Regional division fishnet layer created in ArCGIS (size restrictions in R), see # 7 in instructions below. Using fishet, extracted centroids of each polygon (i.e. grid cell)
+```{r}
+marinenet <- shapefile("NZbuffer75km_regional_divisions_fishnet.shp")
+require(rgeos)
+centroid <- gCentroid(marinenet, byid = TRUE)
+#plot(centroid)
+datax <- data.frame(centroid$x, centroid$y)
+
+allnet <- read.table("fishnet_centroids_SI.txt", sep = ",", header = TRUE)
+data_allnet <- allnet[4:5]
+names(data_allnet) <- c("x", "y")
+coordinates(allnet) <- ~POINT_X + POINT_Y
+```
+
+In ARCGIS:
+
+1. NZ_polygon_NZTM2000 imported and buffered (a) 75km and (b) 1km. Buffer for 75km used outside_only command (buffered to ocean, not land) but 1km buffer was clipped using NZ_polygon_NZTM2000 as a mask to land only
+2. YEP_working site locations imported and each point was buffered to 75km
+3. Merged common regions according to $Region == Banks peninsula, North Otago + Otago Peninsula, Catlins, Stewart Island, (Auckland Island, Campbell Island discarded)
+4. 'Minimum Bounding geometry' (MBG), rectangle by area around each of the 4 single, merged, buffer regions
+5. NZ_bufferedNZTM2000_75km_offshore (see step 1) was manually cut ('Cut Polygons Tool") according to region MBG boundaries. The original layer would be copied, cut, and pasted into a new layer for each region --> NZbuffer75km_regional_divisions
+Note (a) the Catlins region includes all of Stewart Island region based on background knowledge and hypothesis about potential foraging locations for Catlins birds, although extent is more than 75km away.
+Note (b) tried using fisheries stats areas to make regions but no consistent way of dividing based on ecology of the birds
+
+6. Created a fishnet (fishnet_75km) of 500m resolution with extent the same as NZbuffer75km_regional_divisions
+7. Clipped fishnet (shp file) to NZbuffer75km_regional_divisions --> NZbuffer75km_regional_divisions_fishnet
+8. 'Feature to point', 'inside' command of NZbuffer75km_regional_divisions_fishnet to ensure even partial cells have a centroid (boundary grid cells not discarded) --> fishnet_75km_centroids
+9. This new shapefile had northing/easting values. In attribute table, added two columns (Lat/Long) and 'Calculate geometry' to add lat/long values to the attribute table. Saved as ascii file
+10. Loaded raster files
+11. 'Extract multivalues to points' for each raster layer which saves values to fishnet_75km_centroids as new columns
+12. Exported to txt file
+13. 'Point to raster' using each new column in fishnet_75km_centroids as the value field, 'most_frequent' cell assignment, and ascii file of the fishnet for the cell sizes
+14. 'Raster to ascii" for each new file
+
+################################################################################
+
+# Original files in raster or shapefile format were read into R, resampled using the fishnet grid. All were saved to TIFF files
+# THE FILENAME FOR EACH ENV FILE NEEDES TO BE MODIFIED TO CORRECT PATH
+
+# sediment layers (rasters) to fishnet extent, resolution
+```{r}
+carbon <- raster("Seafloor_Sediments_NIWA/NZ_Carbonate/Carbonate%1.tif")
+carbon <- projectRaster(carbon, fishnet, 
+                        CRS = nztm, 
+                        method = "ngb", 
+                        filename = "carbon_raster.tif", 
+                        overwrite = TRUE)
+
+mud <- raster("Seafloor_Sediments_NIWA/NZ_Mud/Mud%1.tif")
+mud <- projectRaster(mud, fishnet, 
+                     CRS = nztm, 
+                     method = "ngb", 
+                     filename = "mud_raster.tif", 
+                     overwrite = TRUE)
+
+sand <- raster("Seafloor_Sediments_NIWA/NZ_Sand/Sand%1.tif")
+sand <- projectRaster(sand, fishnet, 
+                      CRS = nztm, 
+                      method = "ngb", 
+                      filename = "sand_raster.tif", 
+                      overwrite = TRUE)
+
+gravel <- raster("Seafloor_Sediments_NIWA/NZ_Gravel/Gravel%1.tif")
+gravel <- projectRaster(gravel, fishnet, 
+                        CRS = nztm, 
+                        method = "ngb", 
+                        filename = "gravel_raster.tif", 
+                        overwrite = TRUE)
+
+# Making a seperate stack for sediment layers
+seafloor <- stack(carbon, sand, gravel, mud)
+```
+
+# Reprojecting bathymetry layer to fishnet extent, resolution
+```{r}
+bathy <- raster("NZBathy_2016_ascii_grid/nzbathymetry_2016_ascii-grid.asc")
+
+bathyres <- projectRaster(bathy, fishnet, 
+                          CRS = nztm, 
+                          method = "ngb", 
+                          filename = "bathymetry_res.tif", 
+                          overwrite = TRUE)
+```
+
+# Reprojecting seafloor chemistry rasters to fishnet extent, resolution
+# Original .lyr files projected, cropped to NZ in ArcGIS, saved as TIFF  
+```{r}
+allasc <- list.files(path = "ArcGIS marine maps", 
+                     pattern = "clip.tif$", 
+                     full.names = TRUE)
+allasc_raster <- lapply(allasc, raster)
+sta <- stack(allasc_raster)
+names(sta)
+
+# Reprojecting/resampling according to fishnet. 
+# ProjectRaster used because unsure of coordinate system
+sfargonite <- sta$SfAragonite_project_clip
+sfargonite_raster <- projectRaster(sfargonite, fishnet, 
+                                   method = "ngb", 
+                                   filename = "sfargonite_raster.tif", 
+                                   overwrite = TRUE)
+
+sfdo <- sta$SfDO_project_clip
+sfdo_raster <- projectRaster(sfdo, fishnet, 
+                             method = "ngb", 
+                             filename = "sfdo_raster.tif", 
+                             overwrite = TRUE)
+
+sfsalinity <- sta$SfSalinity_project_clip
+sfsalinity_raster <- projectRaster(sfsalinity, fishnet, 
+                                   method = "ngb", 
+                                   filename = "sfsalinity_raster.tif", 
+                                   overwrite = TRUE)
+
+sfsilicate <- sta$sfsilicate_project_clip
+sfsilicate_raster <- projectRaster(sfsilicate, fishnet, 
+                                   method = "ngb", 
+                                   filename = "sfsilicate_raster.tif", 
+                                   overwrite = TRUE)
+
+sftemp <- sta$sftemp_project_clip
+sftemp_raster <- projectRaster(sftemp, fishnet, 
+                               method = "ngb", 
+                               filename = "sftemp_raster.tif", 
+                               overwrite = TRUE)
+```
+
+# Reprojecting ocean chemistry rasters to fishnet extent, resolution
+# Original .tif files from Stephenson (NIWA) in Albers conical equal area projection. Projected to NZTM in ArcGIS Pro, saved as TIFF  
+```{r}
+allchem <- list.files(path = "Stephenson NIWA", 
+                      pattern = "NZTM2000.tif$", 
+                      full.names = TRUE)
+allchem_raster <- lapply(allchem, raster)
+chem <- stack(allchem_raster)
+names(chem)
+
+# Reprojecting/resampling according to fishnet
+# Resample used because coordinate reference system is the same
+salinity_res <- resample(chem$BotSal_NZTM2000, fishnet,
+                         method = 'ngb',
+                         filename = "botsalinity_resample.tif",
+                         overwrite = TRUE)
+
+oxygen_res <- resample(chem$BotOxy_NZTM2000, fishnet, 
+                       method = 'ngb', 
+                       filename = "botoxygen_resample.tif", 
+                       overwrite = TRUE)
+
+temp_res <- resample(chem$BotTemp_NZTM2000, fishnet,
+                     method = 'ngb',
+                     filename = "bottemp_resample.tif",
+                     overwrite = TRUE)
+
+nitrogen_res <- resample(chem$BotNi_NZTM2000, fishnet,
+                         method = 'ngb',
+                         filename = "botnitrogen_resample.tif",
+                         overwrite = TRUE)
+
+current_res <- resample(chem$TC_NZTM2000, fishnet, 
+                        method = 'ngb',
+                        filename = "currents_resample.tif",
+                        overwrite = TRUE)
+```
+
+# Euclidean distance to shore raster created in ArcPro; fishnet extent
+# IDW considered but euc dist more appropriate
+```{r}
+shoredis <- raster("EucDist_SI_fin.tif")
+setwd(folder_out)
+writeRaster(shoredis, 
+            file = "EucDist_SI.asc", 
+            overwrite = TRUE)
+
+writeRaster(shoredis, 
+            file = "EucDist_SI.tif", 
+            overwrite = TRUE)
+
+```
+
+# SST, chlorophyll-A, turbidity layers from NIWA loaded. Oringinal files were monthly .ac layers spanning 2002-2018. See script niwa marine prep.R for further information on layer preperation
+# Rasterstack mean calculated using original extent/resolution. Needs to be resampled here
+```{r}
+setwd("Pinkerton files")
+
+chlamax <- raster("chla_allmax.asc", CRS = nztm)
+chlamin <- raster("chla_allmin.asc", CRS = nztm)
+chlamean <- raster("chla_allmean.asc", CRS = nztm)
+sstmax <- raster("sst_allmax.asc", CRS = nztm)
+sstmin <- raster("sst_allmin.asc", CRS = nztm)
+sstmean <- raster("sst_allmean.asc", CRS = nztm)
+turbmax <- raster("turb_allmax.asc", CRS = nztm)
+turbmin <- raster("turb_allmin.asc", CRS = nztm)
+turbmean <- raster("turb_allmean.asc", CRS = nztm)
+```
+
+# SST, chlorophyll a, turbidity layers from NIWA resampled according to fishnet grid
+```{r}
+chlamaxres <- resample(chlamax, 
+                       fishnet, 
+                       method = 'ngb', 
+                       filename = "chlamax_resample.tif", 
+                       overwrite = TRUE)
+chlaminres <- resample(chlamin, 
+                       fishnet, 
+                       method = 'ngb', 
+                       filename = "chlamin_resample.tif", 
+                       overwrite = TRUE)
+chlameanres <- resample(chlamean, 
+                        fishnet, 
+                        method = 'ngb', 
+                        filename = "chlamean_resample.tif", 
+                        overwrite = TRUE)
+sstmaxres <- resample(sstmax, 
+                      fishnet, 
+                      method = 'ngb', 
+                      filename = "sstmax_resample.tif", 
+                      overwrite = TRUE)
+sstminres <- resample(sstmin, 
+                      fishnet, 
+                      method = 'ngb', 
+                      filename = "sstmin_resample.tif", 
+                      overwrite = TRUE)
+sstmeanres <- resample(sstmean, 
+                       fishnet, 
+                       method = 'ngb', 
+                       filename = "sstmean_resample.tif", 
+                       overwrite = TRUE)
+turbmaxres <- resample(turbmax, 
+                       fishnet, 
+                       method = 'ngb', 
+                       filename = "turbmax_resample.tif", 
+                       overwrite = TRUE)
+turbminres <- resample(turbmin, 
+                       fishnet, 
+                       method = 'ngb', 
+                       filename = "turbmin_resample.tif", 
+                       overwrite = TRUE)
+turbmeanres <- resample(turbmean, 
+                        fishnet, 
+                        method = 'ngb', 
+                        filename = "turbmean_resample.tif", 
+                        overwrite = TRUE)
+```
+
+
+################################################################################
+# Reread files and extract to fishnet centroids; saving
+
+# Check final rasters for crs/extent etc 
+```{r}
+marine <- list.files(pattern = ".tif$")
+all <- lapply(marine, raster)
+stacked <- stack(all)
+```
+
+# Extract raster values, and bind with x/y data from centroids; export file as csv. NA for no value
+```{r}
+asValue <- raster::extract(stacked, centroid)
+rasbind <- cbind(datax, asValue)
+
+# Some extracted points dont make sense, some should be NA.
+# SF layers 0 values should be NA (they are null, not 0)
+rasbind[, 25:29][rasbind[, 25:29] == 0] <- NA
+
+write.csv(rasbind,
+          file = "All Rasters_extracted points.csv", 
+          append = FALSE, 
+          sep = ";", 
+          row.names = FALSE, 
+          col.names = TRUE)
+
+raspoints <- read.csv("R Files 27_5_19/All Rasters_extracted points.csv")
+#coordinates(raspoints) <- ~centroid.x+centroid.y
+```
+
+# Create new rasters from raspoints file of extracted values to marine clip of South Island
+# All rasters above have an extent of the South Island (with values for the whole extent). These new rasters will be clipped to just the marine 75km buffer region (with values for just this area, not the whole extent). This is why they need to be created using extract values instead of just cropping/clipping/masking. 
+```{r}
+raspoints_coords <- raspoints[c(1:2)]
+raspoints_means <- data.frame(raspoints$bathymetry_res, raspoints$sstmax_resample, raspoints$sstmean_resample, raspoints$sstmin_resample, raspoints$chlamax_resample, raspoints$chlamean_resample, raspoints$chlamin_resample, raspoints$turbmax_resample, raspoints$turbmean_resample, raspoints$turbmin_resample, raspoints$carbon_raster, raspoints$mud_raster, raspoints$gravel_raster, raspoints$sand_raster, raspoints$sfargonite_raster, raspoints$sfsalinity_raster, raspoints$sfsilicate_raster, raspoints$sftemp_raster, raspoints$sfdo_raster, raspoints$EucDist_SI, raspoints$botnitrogen_resample, raspoints$botoxygen_resample, raspoints$botsalinity_resample, raspoints$bottemp_resample, raspoints$currents_resample)
+
+# Using mean function for interpolation (only for a subset of the layers) 
+for (i in 1:length(raspoints_means)){
+  nam <- unlist(strsplit(names(raspoints_means[i]), "[[:punct:]]"))
+  fname <- nam[2]
+  marine_ras <- rasterize(raspoints_coords,
+                          allreg,
+                          raspoints_means[i],
+                          fun = mean, 
+                          na.rm = TRUE,
+                          filename = paste(fname, "formapping.tif", sep = "_"),
+                          overwrite = TRUE)
+  values(marine_ras)[is.na(values(marine_ras))] <- -9999
+  writeRaster(marine_ras, 
+              NAflag = -9999,
+              filename = paste(fname, "final.tif", sep = "_"),
+              overwrite = TRUE)
+  writeRaster(marine_ras,
+              NAflag = -9999,
+              filename = paste(fname, "final.asc", sep = "_"),
+              overwrite = TRUE)
+}  
+
+# formapping.tif -> -inf, GIS shows only values min-max
+# final.tif -> -9999, GIS shows -9999-max values
+# final.asc -> -9999, for maxent
+```
+
+# Summary of the differences between the three types of raster files created. 
+# When read in, NAvalue = -INF, even though this is not the case for final.tif/final.asc. When plotted, they all look the same. But these files have a NAvalue = -9999, which would have to be explicitly defined when/if these files are read in. For this reason, we used the formapping files. 
+```{r}
+# FORMAPPING.TIF
+# class      : RasterLayer 
+# dimensions : 611, 397, 242567  (nrow, ncol, ncell)
+# resolution : 500, 500  (x, y)
+# extent     : 1350742, 1549242, 4794816, 5100316  (xmin, xmax, ymin, ymax)
+# crs        : +proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs 
+# source     : bathymetry_Otago_formapping.tif 
+# names      : bathymetry_formapping 
+# values     : -1576.339, 125.7824  (min, max)
+# 
+# 
+# FINAL.TIF
+# class      : RasterLayer 
+# dimensions : 611, 397, 242567  (nrow, ncol, ncell)
+# resolution : 500, 500  (x, y)
+# extent     : 1350742, 1549242, 4794816, 5100316  (xmin, xmax, ymin, ymax)
+# crs        : +proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs 
+# source     : bathymetry_Otago.tif 
+# names      : bathymetry
+# values     : -9999, 125.7824  (min, max)
+# 
+# FINAL.ASC
+# class      : RasterLayer 
+# dimensions : 611, 397, 242567  (nrow, ncol, ncell)
+# resolution : 500, 500  (x, y)
+# extent     : 1350742, 1549242, 4794816, 5100316  (xmin, xmax, ymin, ymax)
+# crs        : NA 
+# source     : bathymetry_Otago.asc 
+# names      : bathymetry
+```
+
