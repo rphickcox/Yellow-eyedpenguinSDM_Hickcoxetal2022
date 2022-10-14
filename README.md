@@ -2,7 +2,7 @@
 
 This code accompanies the following paper: 
 
-Hickcox, R.P., van Heezik, Y., Mattern, T., Rodríguez Recio, M., Young, M. J., Seddon, P. J. (In review). Staying close to home: marine habitat selection by foraging yellow-eyed penguins using spatial distribution models.
+Hickcox, R. P., Mattern, T., Rodríguez-Recio, M., Young, M. J., van Heezik, Y., & Seddon, P. J. (2022). Staying close to home: Marine habitat selection by foraging yellow-eyed penguins using spatial distribution models. Frontiers in Marine Science, 9, 967741. https://doi.org/10.3389/fmars.2022.967741
 
 Files are saved to a working directory and subfolders therein. Some data is not provided but may be made available upon request. See the paper for details about the sources of spatial data and for GPS tracking methods, including device and data descriptions. 
 
